@@ -1,24 +1,26 @@
 # Avatar Audio Canvas Tool
 
-Ein einfaches Browser-Tool, um einen gezeichneten Avatar (z. B. Strichmännchen) auf Sprache reagieren zu lassen.
+Ein Browser-Tool, mit dem du links einen Avatar zeichnest und rechts einen separaten Output für OBS bekommst.
 
 ## Features
 
-- Freies Zeichnen auf einem Canvas
-- Heuristische Erkennung der Gesichtsposition aus der Zeichnung
-- Mikrofonanalyse (Lautstärke + grobe Pitch-Schätzung)
-- Mimik-Overlay (Augen + Mund) mit Audio-reaktiver Lippenbewegung
-- Transparenter Hintergrund-Modus für OBS Browser Source
+- **2 Canvas-Flächen:**
+  - Zeichen-Canvas (Input)
+  - Output-Canvas (für OBS)
+- Heuristische Gesichtserkennung + sichtbare Markierung des erkannten Bereichs
+- Übernahme deiner Zeichnung in den Output (neutraler Ausdruck = exakt deine Zeichnung)
+- Mikrofonanalyse und Animation auf Basis deines gezeichneten Gesichts
+- Transparenter Output-Hintergrund für OBS Browser Source
 
 ## Nutzung
 
 1. `index.html` im Browser öffnen (direkt per Doppelklick funktioniert; alternativ per lokalem Webserver).
-2. Avatar zeichnen.
-3. **Gesicht erkennen** klicken.
-4. **Mikrofon starten** klicken und Berechtigung erlauben.
-5. In OBS als Browser Source einbinden.
+2. Links Avatar zeichnen.
+3. **Gesicht erkennen** klicken und die markierte Box prüfen.
+4. **In Output übernehmen** klicken.
+5. Optional: **Mikrofon starten** für Animation.
 
-## OBS-Hinweis
+## Wichtiger Hinweis
 
-- Aktiviere in der App `Transparenter Hintergrund`, wenn du die Quelle über dein Stream-Layout legen willst.
-- Stelle in OBS dieselbe Auflösung wie im Canvas ein (960x540), falls du 1:1 Pixel möchtest.
+- Der neutrale Zustand im Output bleibt dein original gezeichnetes Gesicht.
+- Die Animation nutzt diesen gezeichneten Gesichtsausschnitt, statt ein vordefiniertes Cartoon-Gesicht zu zeichnen.

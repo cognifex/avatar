@@ -1,55 +1,77 @@
 const drawCanvas = document.getElementById('drawCanvas');
-const avatarCanvas = document.getElementById('avatarCanvas');
+const drawGuideCanvas = document.getElementById('drawGuideCanvas');
+const outputCanvas = document.getElementById('outputCanvas');
+
 const brushSizeInput = document.getElementById('brushSize');
 const clearBtn = document.getElementById('clearBtn');
 const detectBtn = document.getElementById('detectBtn');
+const copyBtn = document.getElementById('copyBtn');
 const micBtn = document.getElementById('micBtn');
 const stopMicBtn = document.getElementById('stopMicBtn');
 const statusEl = document.getElementById('status');
 const transparentBg = document.getElementById('transparentBg');
-const canvasWrap = document.getElementById('canvasWrap');
+const outputWrap = document.getElementById('outputWrap');
 
 const drawCtx = drawCanvas.getContext('2d');
-const avatarCtx = avatarCanvas.getContext('2d');
+const guideCtx = drawGuideCanvas.getContext('2d');
+const outputCtx = outputCanvas.getContext('2d');
+
+const bufferCanvas = document.createElement('canvas');
+bufferCanvas.width = drawCanvas.width;
+bufferCanvas.height = drawCanvas.height;
+const bufferCtx = bufferCanvas.getContext('2d');
 
 let drawing = false;
 let audioCtx;
 let analyser;
 let micStream;
-let animationId;
+let audioLoopId;
+let renderId;
 
 const audioState = {
   level: 0,
   pitchHz: 0,
-  expression: 'neutral',
   mouthOpen: 0,
 };
 
-const faceModel = {
-  detected: false,
-  cx: drawCanvas.width / 2,
-  cy: drawCanvas.height / 2,
-  r: 48,
+const avatarState = {
+  faceBox: null,
+  baseFrame: null,
 };
 
 setupDrawing();
-requestAnimationFrame(render);
+renderId = requestAnimationFrame(renderOutput);
 
 clearBtn.addEventListener('click', () => {
   drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
-  avatarCtx.clearRect(0, 0, avatarCanvas.width, avatarCanvas.height);
-  faceModel.detected = false;
-  setStatus('Canvas geleert. Bitte neu zeichnen und Gesicht erneut erkennen.');
+  guideCtx.clearRect(0, 0, drawGuideCanvas.width, drawGuideCanvas.height);
+  outputCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
+  avatarState.faceBox = null;
+  avatarState.baseFrame = null;
+  setStatus('Zeichnung gelöscht. Bitte neu zeichnen und Gesicht erkennen.');
 });
 
 detectBtn.addEventListener('click', () => {
-  const result = detectFaceFromDrawing();
-  if (!result) {
-    setStatus('Kein Gesicht erkannt. Zeichne einen klaren Kopf (z. B. Kreis) im oberen Bereich.');
+  const box = detectFaceBoxFromDrawing();
+  if (!box) {
+    avatarState.faceBox = null;
+    drawFaceGuide();
+    setStatus('Kein Gesicht gefunden. Zeichne den Kopf deutlicher (geschlossene Form hilft).');
     return;
   }
-  Object.assign(faceModel, result, { detected: true });
-  setStatus(`Gesicht erkannt bei x=${Math.round(result.cx)}, y=${Math.round(result.cy)}.`);
+  avatarState.faceBox = box;
+  drawFaceGuide();
+  setStatus(`Gesicht erkannt (x=${Math.round(box.x)}, y=${Math.round(box.y)}, w=${Math.round(box.w)}, h=${Math.round(box.h)}).`);
+});
+
+copyBtn.addEventListener('click', () => {
+  avatarState.baseFrame = drawCtx.getImageData(0, 0, drawCanvas.width, drawCanvas.height);
+  outputCtx.putImageData(avatarState.baseFrame, 0, 0);
+  if (!avatarState.faceBox) {
+    setStatus('Zeichnung wurde in den Output übernommen. Tipp: Zusätzlich "Gesicht erkennen" für Animation.');
+    return;
+  }
+  setStatus('Zeichnung inkl. erkanntem Gesicht in den Output übernommen. Neutral = exakt deine Zeichnung.');
 });
 
 micBtn.addEventListener('click', async () => {
@@ -57,7 +79,7 @@ micBtn.addEventListener('click', async () => {
     await startMic();
     micBtn.disabled = true;
     stopMicBtn.disabled = false;
-    setStatus('Mikrofon aktiv. Avatar reagiert jetzt auf Sprache.');
+    setStatus('Mikrofon aktiv. Output wird jetzt über deinem neutralen Gesicht animiert.');
   } catch (err) {
     console.error(err);
     setStatus('Mikrofon konnte nicht gestartet werden. Bitte Berechtigung prüfen.');
@@ -72,7 +94,7 @@ stopMicBtn.addEventListener('click', () => {
 });
 
 transparentBg.addEventListener('change', () => {
-  canvasWrap.classList.toggle('transparent', transparentBg.checked);
+  outputWrap.classList.toggle('transparent', transparentBg.checked);
 });
 
 function setupDrawing() {
@@ -80,46 +102,46 @@ function setupDrawing() {
   drawCtx.lineJoin = 'round';
   drawCtx.strokeStyle = '#f8fafc';
 
-  const begin = (event) => {
+  drawCanvas.addEventListener('pointerdown', (event) => {
     drawing = true;
-    const p = getPos(event);
+    const p = getPos(event, drawCanvas);
     drawCtx.beginPath();
     drawCtx.moveTo(p.x, p.y);
-  };
+  });
 
-  const move = (event) => {
+  drawCanvas.addEventListener('pointermove', (event) => {
     if (!drawing) return;
-    const p = getPos(event);
+    const p = getPos(event, drawCanvas);
     drawCtx.lineWidth = Number(brushSizeInput.value);
     drawCtx.lineTo(p.x, p.y);
     drawCtx.stroke();
-  };
+  });
 
-  const end = () => {
+  const endStroke = () => {
+    if (!drawing) return;
     drawing = false;
     drawCtx.closePath();
   };
 
-  drawCanvas.addEventListener('pointerdown', begin);
-  drawCanvas.addEventListener('pointermove', move);
-  drawCanvas.addEventListener('pointerup', end);
-  drawCanvas.addEventListener('pointerleave', end);
+  drawCanvas.addEventListener('pointerup', endStroke);
+  drawCanvas.addEventListener('pointerleave', endStroke);
 }
 
-function getPos(event) {
-  const rect = drawCanvas.getBoundingClientRect();
-  const sx = drawCanvas.width / rect.width;
-  const sy = drawCanvas.height / rect.height;
+function getPos(event, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
   return {
     x: (event.clientX - rect.left) * sx,
     y: (event.clientY - rect.top) * sy,
   };
 }
 
-function detectFaceFromDrawing() {
-  const { width, height } = drawCanvas;
-  const data = drawCtx.getImageData(0, 0, width, height).data;
-  const stride = width * 4;
+function detectFaceBoxFromDrawing() {
+  const width = drawCanvas.width;
+  const height = drawCanvas.height;
+  const image = drawCtx.getImageData(0, 0, width, height);
+  const data = image.data;
 
   const visited = new Uint8Array(width * height);
   const components = [];
@@ -127,38 +149,49 @@ function detectFaceFromDrawing() {
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = y * width + x;
-      if (visited[idx] || !isInkPixel(data, stride, x, y)) continue;
-      const comp = floodComponent(data, width, height, stride, x, y, visited);
-      if (comp.area > 130) components.push(comp);
+      if (visited[idx] || !isInkPixel(data, width, x, y)) continue;
+      const comp = floodComponent(data, width, height, x, y, visited);
+      if (comp.area > 120) components.push(comp);
     }
   }
 
   if (!components.length) return null;
 
   const scored = components
-    .map((c) => {
-      const w = c.maxX - c.minX + 1;
-      const h = c.maxY - c.minY + 1;
-      const aspectPenalty = Math.abs(1 - w / h);
-      const topBias = c.cy / height;
-      const roundness = 1 - aspectPenalty;
-      const score = roundness * 0.6 + (1 - topBias) * 0.4;
-      return { ...c, score };
+    .map((comp) => {
+      const w = comp.maxX - comp.minX + 1;
+      const h = comp.maxY - comp.minY + 1;
+      const aspect = w / h;
+      const roundish = 1 - Math.min(1, Math.abs(1 - aspect));
+      const topFactor = 1 - comp.cy / height;
+      const areaFactor = Math.min(1, comp.area / 9000);
+      const score = roundish * 0.45 + topFactor * 0.35 + areaFactor * 0.2;
+      return { comp, w, h, score };
     })
     .sort((a, b) => b.score - a.score);
 
   const best = scored[0];
-  const radius = Math.max(18, Math.min(best.maxX - best.minX, best.maxY - best.minY) * 0.28);
-  return { cx: best.cx, cy: best.cy, r: radius };
+  const padX = Math.max(10, best.w * 0.15);
+  const padY = Math.max(12, best.h * 0.18);
+  const x = Math.max(0, best.comp.minX - padX);
+  const y = Math.max(0, best.comp.minY - padY);
+  const maxX = Math.min(width, best.comp.maxX + padX);
+  const maxY = Math.min(height, best.comp.maxY + padY);
+
+  return {
+    x,
+    y,
+    w: maxX - x,
+    h: maxY - y,
+  };
 }
 
-function isInkPixel(data, stride, x, y) {
-  const off = y * stride + x * 4;
-  const alpha = data[off + 3];
-  return alpha > 25;
+function isInkPixel(data, width, x, y) {
+  const off = (y * width + x) * 4;
+  return data[off + 3] > 25;
 }
 
-function floodComponent(data, width, height, stride, sx, sy, visited) {
+function floodComponent(data, width, height, sx, sy, visited) {
   const stack = [[sx, sy]];
   let area = 0;
   let sumX = 0;
@@ -174,7 +207,7 @@ function floodComponent(data, width, height, stride, sx, sy, visited) {
     const idx = y * width + x;
     if (visited[idx]) continue;
     visited[idx] = 1;
-    if (!isInkPixel(data, stride, x, y)) continue;
+    if (!isInkPixel(data, width, x, y)) continue;
 
     area++;
     sumX += x;
@@ -201,6 +234,22 @@ function floodComponent(data, width, height, stride, sx, sy, visited) {
   };
 }
 
+function drawFaceGuide() {
+  guideCtx.clearRect(0, 0, drawGuideCanvas.width, drawGuideCanvas.height);
+  if (!avatarState.faceBox) return;
+
+  const { x, y, w, h } = avatarState.faceBox;
+  guideCtx.save();
+  guideCtx.strokeStyle = '#22d3ee';
+  guideCtx.lineWidth = 2;
+  guideCtx.setLineDash([8, 6]);
+  guideCtx.strokeRect(x, y, w, h);
+  guideCtx.fillStyle = '#22d3ee';
+  guideCtx.font = '16px sans-serif';
+  guideCtx.fillText('Erkanntes Gesicht', x + 8, Math.max(18, y - 8));
+  guideCtx.restore();
+}
+
 async function startMic() {
   micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   audioCtx = new AudioContext();
@@ -210,11 +259,9 @@ async function startMic() {
   source.connect(analyser);
 
   const timeData = new Float32Array(analyser.fftSize);
-  const freqData = new Uint8Array(analyser.frequencyBinCount);
 
-  const tick = () => {
+  const loop = () => {
     analyser.getFloatTimeDomainData(timeData);
-    analyser.getByteFrequencyData(freqData);
 
     const rms = Math.sqrt(timeData.reduce((acc, v) => acc + v * v, 0) / timeData.length);
     audioState.level = smooth(audioState.level, rms, 0.25);
@@ -222,42 +269,33 @@ async function startMic() {
     const pitch = estimatePitch(timeData, audioCtx.sampleRate);
     audioState.pitchHz = smooth(audioState.pitchHz, pitch, 0.2);
 
-    audioState.expression = classifyExpression(audioState.level, audioState.pitchHz);
     const pulse = Math.abs(Math.sin(performance.now() / 95));
     audioState.mouthOpen = Math.min(1, audioState.level * 18) * (0.55 + 0.45 * pulse);
 
-    animationId = requestAnimationFrame(tick);
+    audioLoopId = requestAnimationFrame(loop);
   };
 
-  tick();
+  loop();
 }
 
 function stopMic() {
-  if (animationId) {
-    cancelAnimationFrame(animationId);
-    animationId = undefined;
-  }
+  if (audioLoopId) cancelAnimationFrame(audioLoopId);
+  audioLoopId = undefined;
+
   if (micStream) {
     micStream.getTracks().forEach((t) => t.stop());
     micStream = null;
   }
+
   if (audioCtx) {
     audioCtx.close();
     audioCtx = null;
   }
+
   analyser = null;
   audioState.level = 0;
   audioState.pitchHz = 0;
-  audioState.expression = 'neutral';
   audioState.mouthOpen = 0;
-}
-
-function classifyExpression(level, pitchHz) {
-  if (level > 0.095) return pitchHz > 220 ? 'surprised' : 'angry';
-  if (level < 0.02) return 'neutral';
-  if (pitchHz > 180) return 'happy';
-  if (pitchHz && pitchHz < 130) return 'sad';
-  return 'focused';
 }
 
 function estimatePitch(samples, sampleRate) {
@@ -286,75 +324,58 @@ function smooth(prev, next, alpha) {
   return prev + alpha * (next - prev);
 }
 
-function render() {
-  avatarCtx.clearRect(0, 0, avatarCanvas.width, avatarCanvas.height);
+function renderOutput() {
+  outputCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
 
-  if (faceModel.detected) {
-    drawFaceOverlay(faceModel, audioState);
+  if (avatarState.baseFrame) {
+    outputCtx.putImageData(avatarState.baseFrame, 0, 0);
+
+    if (avatarState.faceBox && audioState.mouthOpen > 0.01) {
+      animateMouthFromDrawing(avatarState.faceBox, audioState.mouthOpen);
+    }
+
+    if (avatarState.faceBox && audioState.level > 0.08) {
+      animateHeadBounce(avatarState.faceBox, audioState.level);
+    }
   }
 
-  requestAnimationFrame(render);
+  renderId = requestAnimationFrame(renderOutput);
 }
 
-function drawFaceOverlay(face, audio) {
-  const { cx, cy, r } = face;
-  const eyeY = cy - r * 0.2;
-  const eyeDX = r * 0.42;
+function animateMouthFromDrawing(faceBox, mouthOpen) {
+  const { x, y, w, h } = faceBox;
+  const stripY = y + h * 0.55;
+  const stripH = h * 0.33;
 
-  avatarCtx.save();
-  avatarCtx.strokeStyle = '#22d3ee';
-  avatarCtx.lineWidth = Math.max(2, r * 0.07);
+  bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
+  bufferCtx.drawImage(outputCanvas, 0, 0);
 
-  drawEyes(cx - eyeDX, eyeY, cx + eyeDX, eyeY, r, audio.expression);
-  drawMouth(cx, cy + r * 0.45, r, audio.mouthOpen, audio.expression);
-  avatarCtx.restore();
+  outputCtx.clearRect(x - 2, stripY - 2, w + 4, stripH + h * 0.25 + 4);
+
+  const expandedH = stripH * (1 + mouthOpen * 0.9);
+  outputCtx.drawImage(
+    bufferCanvas,
+    x,
+    stripY,
+    w,
+    stripH,
+    x,
+    stripY,
+    w,
+    expandedH,
+  );
 }
 
-function drawEyes(x1, y1, x2, y2, r, expression) {
-  const h = r * 0.12;
-  avatarCtx.beginPath();
+function animateHeadBounce(faceBox, level) {
+  const { x, y, w, h } = faceBox;
+  const amp = Math.min(6, level * 60);
+  const offsetY = Math.sin(performance.now() / 70) * amp;
 
-  if (expression === 'sad') {
-    avatarCtx.moveTo(x1 - h, y1 + h * 0.8);
-    avatarCtx.lineTo(x1 + h, y1 - h * 0.8);
-    avatarCtx.moveTo(x2 - h, y2 - h * 0.8);
-    avatarCtx.lineTo(x2 + h, y2 + h * 0.8);
-  } else if (expression === 'angry') {
-    avatarCtx.moveTo(x1 - h, y1 - h * 0.8);
-    avatarCtx.lineTo(x1 + h, y1 + h * 0.8);
-    avatarCtx.moveTo(x2 - h, y2 + h * 0.8);
-    avatarCtx.lineTo(x2 + h, y2 - h * 0.8);
-  } else if (expression === 'surprised') {
-    avatarCtx.arc(x1, y1, h * 0.9, 0, Math.PI * 2);
-    avatarCtx.moveTo(x2 + h * 0.9, y2);
-    avatarCtx.arc(x2, y2, h * 0.9, 0, Math.PI * 2);
-  } else {
-    avatarCtx.moveTo(x1 - h, y1);
-    avatarCtx.lineTo(x1 + h, y1);
-    avatarCtx.moveTo(x2 - h, y2);
-    avatarCtx.lineTo(x2 + h, y2);
-  }
+  bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
+  bufferCtx.drawImage(outputCanvas, 0, 0);
 
-  avatarCtx.stroke();
-}
-
-function drawMouth(cx, y, r, mouthOpen, expression) {
-  const w = r * 0.65;
-  const openH = Math.max(2, r * 0.42 * mouthOpen);
-
-  avatarCtx.beginPath();
-
-  if (expression === 'sad') {
-    avatarCtx.ellipse(cx, y + r * 0.08, w * 0.5, openH * 0.6, 0, Math.PI, 0, true);
-  } else if (expression === 'happy') {
-    avatarCtx.ellipse(cx, y, w * 0.5, openH + r * 0.05, 0, 0, Math.PI);
-  } else if (expression === 'surprised') {
-    avatarCtx.ellipse(cx, y, w * 0.24, openH + r * 0.12, 0, 0, Math.PI * 2);
-  } else {
-    avatarCtx.ellipse(cx, y, w * 0.5, openH, 0, 0, Math.PI * 2);
-  }
-
-  avatarCtx.stroke();
+  outputCtx.clearRect(x - 2, y - 2, w + 4, h + 4);
+  outputCtx.drawImage(bufferCanvas, x, y, w, h, x, y + offsetY, w, h);
 }
 
 function setStatus(message) {
