@@ -12,7 +12,7 @@ Ein einfaches Browser-Tool, um einen gezeichneten Avatar (z. B. Strichmännchen)
 
 ## Nutzung
 
-1. `index.html` im Browser öffnen (oder per lokalem Webserver ausliefern).
+1. `index.html` im Browser öffnen (direkt per Doppelklick funktioniert; alternativ per lokalem Webserver).
 2. Avatar zeichnen.
 3. **Gesicht erkennen** klicken.
 4. **Mikrofon starten** klicken und Berechtigung erlauben.
