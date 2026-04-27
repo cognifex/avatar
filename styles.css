@@ -1,0 +1,98 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #161821;
+  color: #f3f4f6;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 16px;
+  min-height: 100vh;
+  padding: 16px;
+}
+
+.controls {
+  background: #1f2532;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 16px;
+}
+
+h1 { margin-top: 0; font-size: 1.3rem; }
+h2 { margin: 0 0 8px; font-size: 1rem; color: #cbd5e1; }
+
+.toolbar {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+button, input[type='range'] { width: 100%; }
+
+button {
+  cursor: pointer;
+  border: 1px solid #4f46e5;
+  background: #4f46e5;
+  color: white;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-weight: 600;
+}
+
+button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.toggle { display: flex; align-items: center; gap: 8px; }
+
+.status {
+  margin-top: 12px;
+  color: #93c5fd;
+  min-height: 42px;
+}
+
+.stage {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(300px, 1fr));
+  gap: 14px;
+  align-content: start;
+}
+
+.canvas-wrap {
+  position: relative;
+  width: 100%;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #090c13;
+}
+
+canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+#drawGuideCanvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.transparent {
+  background: transparent !important;
+}
+
+@media (max-width: 1280px) {
+  .app { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  .stage { grid-template-columns: 1fr; }
+}
