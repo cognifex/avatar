@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Avatar Audio Canvas Tool</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="controls">
+        <h1>Avatar Canvas für Streaming</h1>
+        <p>
+          Zeichne deinen Avatar (z. B. Strichmännchen), erkenne das Gesicht und lass
+          ihn auf Mikrofon-Audio reagieren.
+        </p>
+
+        <div class="toolbar">
+          <label>
+            Pinselgröße
+            <input id="brushSize" type="range" min="1" max="24" value="4" />
+          </label>
+          <button id="clearBtn" type="button">Canvas leeren</button>
+          <button id="detectBtn" type="button">Gesicht erkennen</button>
+          <button id="micBtn" type="button">Mikrofon starten</button>
+          <button id="stopMicBtn" type="button" disabled>Mikrofon stoppen</button>
+        </div>
+
+        <label class="toggle">
+          <input id="transparentBg" type="checkbox" />
+          Transparenter Hintergrund (für OBS)
+        </label>
+
+        <p id="status" class="status">
+          Bereit. Zeichne zuerst dein Strichmännchen und klicke dann auf "Gesicht
+          erkennen".
+        </p>
+      </section>
+
+      <section class="stage" aria-label="Zeichenfläche">
+        <div class="canvas-wrap" id="canvasWrap">
+          <canvas id="drawCanvas" width="960" height="540"></canvas>
+          <canvas id="avatarCanvas" width="960" height="540"></canvas>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
