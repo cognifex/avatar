@@ -36,6 +36,7 @@ const audioState = {
 
 const avatarState = {
   faceBox: null,
+  faceRegions: null,
   baseFrame: null,
 };
 
@@ -47,6 +48,7 @@ clearBtn.addEventListener('click', () => {
   guideCtx.clearRect(0, 0, drawGuideCanvas.width, drawGuideCanvas.height);
   outputCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
   avatarState.faceBox = null;
+  avatarState.faceRegions = null;
   avatarState.baseFrame = null;
   setStatus('Zeichnung gelöscht. Bitte neu zeichnen und Gesicht erkennen.');
 });
@@ -55,13 +57,17 @@ detectBtn.addEventListener('click', () => {
   const box = detectFaceBoxFromDrawing();
   if (!box) {
     avatarState.faceBox = null;
+    avatarState.faceRegions = null;
     drawFaceGuide();
     setStatus('Kein Gesicht gefunden. Zeichne den Kopf deutlicher (geschlossene Form hilft).');
     return;
   }
+
+  const regions = detectFaceRegionsFromDrawing(box);
   avatarState.faceBox = box;
+  avatarState.faceRegions = regions;
   drawFaceGuide();
-  setStatus(`Gesicht erkannt (x=${Math.round(box.x)}, y=${Math.round(box.y)}, w=${Math.round(box.w)}, h=${Math.round(box.h)}).`);
+  setStatus(buildDetectionStatus(box, regions));
 });
 
 copyBtn.addEventListener('click', () => {
@@ -248,6 +254,167 @@ function drawFaceGuide() {
   guideCtx.font = '16px sans-serif';
   guideCtx.fillText('Erkanntes Gesicht', x + 8, Math.max(18, y - 8));
   guideCtx.restore();
+
+  const overlays = [
+    { key: 'mouth', label: 'Mund', stroke: '#f97316', fill: 'rgba(249, 115, 22, 0.24)' },
+    { key: 'leftEye', label: 'Auge links', stroke: '#38bdf8', fill: 'rgba(56, 189, 248, 0.22)' },
+    { key: 'rightEye', label: 'Auge rechts', stroke: '#818cf8', fill: 'rgba(129, 140, 248, 0.22)' },
+    { key: 'brows', label: 'Brauen', stroke: '#a3e635', fill: 'rgba(163, 230, 53, 0.2)' },
+    { key: 'jaw', label: 'Kiefer', stroke: '#facc15', fill: 'rgba(250, 204, 21, 0.18)' },
+  ];
+
+  overlays.forEach((overlay) => {
+    const region = avatarState.faceRegions?.[overlay.key];
+    if (!region) return;
+    drawRegionOverlay(region, overlay);
+  });
+}
+
+function drawRegionOverlay(region, overlay) {
+  guideCtx.save();
+  guideCtx.strokeStyle = overlay.stroke;
+  guideCtx.fillStyle = overlay.fill;
+  guideCtx.lineWidth = 2;
+  guideCtx.setLineDash([]);
+
+  if (region.type === 'polygon' && region.points?.length >= 3) {
+    guideCtx.beginPath();
+    guideCtx.moveTo(region.points[0].x, region.points[0].y);
+    for (let i = 1; i < region.points.length; i++) {
+      guideCtx.lineTo(region.points[i].x, region.points[i].y);
+    }
+    guideCtx.closePath();
+    guideCtx.fill();
+    guideCtx.stroke();
+  } else if (region.type === 'rect') {
+    guideCtx.fillRect(region.x, region.y, region.w, region.h);
+    guideCtx.strokeRect(region.x, region.y, region.w, region.h);
+  }
+
+  const labelX = region.type === 'rect' ? region.x + 6 : region.points[0].x + 6;
+  const labelY = region.type === 'rect' ? region.y - 6 : region.points[0].y - 6;
+  guideCtx.fillStyle = overlay.stroke;
+  guideCtx.font = '13px sans-serif';
+  guideCtx.fillText(overlay.label, labelX, Math.max(14, labelY));
+  guideCtx.restore();
+}
+
+function detectFaceRegionsFromDrawing(faceBox) {
+  const { x, y, w, h } = faceBox;
+  const width = drawCanvas.width;
+  const image = drawCtx.getImageData(0, 0, drawCanvas.width, drawCanvas.height);
+  const data = image.data;
+
+  const clampedBox = {
+    x: Math.max(0, Math.floor(x)),
+    y: Math.max(0, Math.floor(y)),
+    w: Math.max(1, Math.ceil(w)),
+    h: Math.max(1, Math.ceil(h)),
+  };
+
+  const regions = {
+    mouth: detectBandRect(data, width, clampedBox, [0.54, 0.92], [0.2, 0.85]),
+    leftEye: detectBandRect(data, width, clampedBox, [0.2, 0.55], [0.05, 0.5]),
+    rightEye: detectBandRect(data, width, clampedBox, [0.2, 0.55], [0.5, 0.95]),
+    brows: detectBrowsPolygon(data, width, clampedBox),
+    jaw: detectBandRect(data, width, clampedBox, [0.78, 1.0], [0.08, 0.92]),
+  };
+
+  return regions;
+}
+
+function detectBandRect(data, width, faceBox, yRange, xRange) {
+  const rx = faceBox.x + faceBox.w * xRange[0];
+  const ry = faceBox.y + faceBox.h * yRange[0];
+  const rw = faceBox.w * (xRange[1] - xRange[0]);
+  const rh = faceBox.h * (yRange[1] - yRange[0]);
+  const box = {
+    x: Math.floor(rx),
+    y: Math.floor(ry),
+    w: Math.max(2, Math.ceil(rw)),
+    h: Math.max(2, Math.ceil(rh)),
+  };
+  const rect = detectLargestInkRect(data, width, box);
+  if (rect) return rect;
+
+  return {
+    type: 'rect',
+    x: box.x,
+    y: box.y,
+    w: box.w,
+    h: box.h,
+    estimated: true,
+  };
+}
+
+function detectLargestInkRect(data, width, box) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let count = 0;
+
+  for (let yy = box.y; yy < box.y + box.h; yy++) {
+    for (let xx = box.x; xx < box.x + box.w; xx++) {
+      if (!isInkPixel(data, width, xx, yy)) continue;
+      minX = Math.min(minX, xx);
+      minY = Math.min(minY, yy);
+      maxX = Math.max(maxX, xx);
+      maxY = Math.max(maxY, yy);
+      count++;
+    }
+  }
+
+  if (count < 12 || !Number.isFinite(minX)) return null;
+  return {
+    type: 'rect',
+    x: minX,
+    y: minY,
+    w: Math.max(2, maxX - minX + 1),
+    h: Math.max(2, maxY - minY + 1),
+    estimated: false,
+  };
+}
+
+function detectBrowsPolygon(data, width, faceBox) {
+  const browBand = detectBandRect(data, width, faceBox, [0.07, 0.33], [0.05, 0.95]);
+  if (!browBand) return null;
+  const { x, y, w, h } = browBand;
+  return {
+    type: 'polygon',
+    points: [
+      { x: x, y: y + h },
+      { x: x + w * 0.12, y: y + h * 0.15 },
+      { x: x + w * 0.32, y: y },
+      { x: x + w * 0.5, y: y + h * 0.2 },
+      { x: x + w * 0.68, y: y },
+      { x: x + w * 0.88, y: y + h * 0.15 },
+      { x: x + w, y: y + h },
+    ],
+    estimated: !!browBand.estimated,
+  };
+}
+
+function buildDetectionStatus(faceBox, regions) {
+  const checks = [
+    { key: 'mouth', label: 'Mund' },
+    { key: 'leftEye', label: 'Auge links' },
+    { key: 'rightEye', label: 'Auge rechts' },
+    { key: 'brows', label: 'Brauen' },
+  ];
+
+  const hit = [];
+  const unsure = [];
+  checks.forEach((item) => {
+    const region = regions?.[item.key];
+    if (region && !region.estimated) hit.push(item.label);
+    else unsure.push(item.label);
+  });
+
+  const boxText = `Gesicht erkannt (x=${Math.round(faceBox.x)}, y=${Math.round(faceBox.y)}, w=${Math.round(faceBox.w)}, h=${Math.round(faceBox.h)}).`;
+  if (!hit.length) return `${boxText} Regionen unsicher: ${unsure.join(', ')}.`;
+  if (!unsure.length) return `${boxText} Regionen erkannt: ${hit.join(', ')}.`;
+  return `${boxText} ${hit.join(', ')} erkannt, unsicher: ${unsure.join(', ')}.`;
 }
 
 async function startMic() {
@@ -343,9 +510,12 @@ function renderOutput() {
 }
 
 function animateMouthFromDrawing(faceBox, mouthOpen) {
-  const { x, y, w, h } = faceBox;
-  const stripY = y + h * 0.55;
-  const stripH = h * 0.33;
+  const mouthRect = avatarState.faceRegions?.mouth?.type === 'rect'
+    ? avatarState.faceRegions.mouth
+    : null;
+  const { x, y, w, h } = mouthRect || faceBox;
+  const stripY = mouthRect ? y : y + h * 0.55;
+  const stripH = mouthRect ? h : h * 0.33;
 
   bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
   bufferCtx.drawImage(outputCanvas, 0, 0);
