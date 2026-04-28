@@ -36,6 +36,7 @@ h2 { margin: 0 0 8px; font-size: 1rem; color: #cbd5e1; }
 }
 
 button, input[type='range'] { width: 100%; }
+select { width: 100%; }
 
 button {
   cursor: pointer;
@@ -55,6 +56,14 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
   margin-top: 12px;
   color: #93c5fd;
   min-height: 42px;
+}
+
+.region-tools {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #334155;
 }
 
 .stage {

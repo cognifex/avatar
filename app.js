@@ -8,6 +8,10 @@ const detectBtn = document.getElementById('detectBtn');
 const copyBtn = document.getElementById('copyBtn');
 const micBtn = document.getElementById('micBtn');
 const stopMicBtn = document.getElementById('stopMicBtn');
+const regionSelect = document.getElementById('regionSelect');
+const drawRegionBtn = document.getElementById('drawRegionBtn');
+const adoptRegionBtn = document.getElementById('adoptRegionBtn');
+const resetRegionBtn = document.getElementById('resetRegionBtn');
 const statusEl = document.getElementById('status');
 const transparentBg = document.getElementById('transparentBg');
 const outputWrap = document.getElementById('outputWrap');
@@ -36,8 +40,18 @@ const audioState = {
 
 const avatarState = {
   faceBox: null,
-  faceRegions: null,
+  autoFaceRegions: null,
+  faceRegions: {},
   baseFrame: null,
+};
+
+const regionEditState = {
+  active: false,
+  target: 'mouth',
+  draftRect: null,
+  dragStart: null,
+  polygonPoints: [],
+  hoverPoint: null,
 };
 
 setupDrawing();
@@ -48,8 +62,10 @@ clearBtn.addEventListener('click', () => {
   guideCtx.clearRect(0, 0, drawGuideCanvas.width, drawGuideCanvas.height);
   outputCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
   avatarState.faceBox = null;
-  avatarState.faceRegions = null;
+  avatarState.autoFaceRegions = null;
+  avatarState.faceRegions = {};
   avatarState.baseFrame = null;
+  stopRegionEdit(false);
   setStatus('Zeichnung gelöscht. Bitte neu zeichnen und Gesicht erkennen.');
 });
 
@@ -57,7 +73,7 @@ detectBtn.addEventListener('click', () => {
   const box = detectFaceBoxFromDrawing();
   if (!box) {
     avatarState.faceBox = null;
-    avatarState.faceRegions = null;
+    avatarState.autoFaceRegions = null;
     drawFaceGuide();
     setStatus('Kein Gesicht gefunden. Zeichne den Kopf deutlicher (geschlossene Form hilft).');
     return;
@@ -65,7 +81,7 @@ detectBtn.addEventListener('click', () => {
 
   const regions = detectFaceRegionsFromDrawing(box);
   avatarState.faceBox = box;
-  avatarState.faceRegions = regions;
+  avatarState.autoFaceRegions = regions;
   drawFaceGuide();
   setStatus(buildDetectionStatus(box, regions));
 });
@@ -103,6 +119,43 @@ transparentBg.addEventListener('change', () => {
   outputWrap.classList.toggle('transparent', transparentBg.checked);
 });
 
+regionSelect.addEventListener('change', () => {
+  regionEditState.target = regionSelect.value;
+  if (regionEditState.active) {
+    stopRegionEdit(false);
+    startRegionEdit();
+  } else {
+    drawFaceGuide();
+  }
+});
+
+drawRegionBtn.addEventListener('click', () => {
+  if (regionEditState.active) {
+    stopRegionEdit();
+    return;
+  }
+  startRegionEdit();
+});
+
+adoptRegionBtn.addEventListener('click', () => {
+  const key = regionSelect.value;
+  const autoRegion = avatarState.autoFaceRegions?.[key];
+  if (!autoRegion) {
+    setStatus('Keine erkannte Region vorhanden. Erst Gesicht erkennen oder Region manuell zeichnen.');
+    return;
+  }
+  avatarState.faceRegions[key] = toManualRegion(autoRegion);
+  drawFaceGuide();
+  setStatus(`Automatisch erkannte Region für "${getRegionLabel(key)}" wurde als fixiert übernommen.`);
+});
+
+resetRegionBtn.addEventListener('click', () => {
+  const key = regionSelect.value;
+  delete avatarState.faceRegions[key];
+  drawFaceGuide();
+  setStatus(`Manuelle Region für "${getRegionLabel(key)}" zurückgesetzt. Automatische Erkennung wird verwendet.`);
+});
+
 function setupDrawing() {
   drawCtx.lineCap = 'round';
   drawCtx.lineJoin = 'round';
@@ -131,6 +184,12 @@ function setupDrawing() {
 
   drawCanvas.addEventListener('pointerup', endStroke);
   drawCanvas.addEventListener('pointerleave', endStroke);
+
+  drawGuideCanvas.addEventListener('pointerdown', onGuidePointerDown);
+  drawGuideCanvas.addEventListener('pointermove', onGuidePointerMove);
+  drawGuideCanvas.addEventListener('pointerup', onGuidePointerUp);
+  drawGuideCanvas.addEventListener('dblclick', onGuideDoubleClick);
+  drawGuideCanvas.addEventListener('contextmenu', (event) => event.preventDefault());
 }
 
 function getPos(event, canvas) {
@@ -242,18 +301,18 @@ function floodComponent(data, width, height, sx, sy, visited) {
 
 function drawFaceGuide() {
   guideCtx.clearRect(0, 0, drawGuideCanvas.width, drawGuideCanvas.height);
-  if (!avatarState.faceBox) return;
-
-  const { x, y, w, h } = avatarState.faceBox;
-  guideCtx.save();
-  guideCtx.strokeStyle = '#22d3ee';
-  guideCtx.lineWidth = 2;
-  guideCtx.setLineDash([8, 6]);
-  guideCtx.strokeRect(x, y, w, h);
-  guideCtx.fillStyle = '#22d3ee';
-  guideCtx.font = '16px sans-serif';
-  guideCtx.fillText('Erkanntes Gesicht', x + 8, Math.max(18, y - 8));
-  guideCtx.restore();
+  if (avatarState.faceBox) {
+    const { x, y, w, h } = avatarState.faceBox;
+    guideCtx.save();
+    guideCtx.strokeStyle = '#22d3ee';
+    guideCtx.lineWidth = 2;
+    guideCtx.setLineDash([8, 6]);
+    guideCtx.strokeRect(x, y, w, h);
+    guideCtx.fillStyle = '#22d3ee';
+    guideCtx.font = '16px sans-serif';
+    guideCtx.fillText('Erkanntes Gesicht', x + 8, Math.max(18, y - 8));
+    guideCtx.restore();
+  }
 
   const overlays = [
     { key: 'mouth', label: 'Mund', stroke: '#f97316', fill: 'rgba(249, 115, 22, 0.24)' },
@@ -264,18 +323,21 @@ function drawFaceGuide() {
   ];
 
   overlays.forEach((overlay) => {
-    const region = avatarState.faceRegions?.[overlay.key];
+    const region = getPreferredRegion(overlay.key);
     if (!region) return;
-    drawRegionOverlay(region, overlay);
+    const isManual = Boolean(avatarState.faceRegions?.[overlay.key]?.manual);
+    drawRegionOverlay(region, overlay, isManual);
   });
+
+  drawRegionDraftOverlay();
 }
 
-function drawRegionOverlay(region, overlay) {
+function drawRegionOverlay(region, overlay, isManual = false) {
   guideCtx.save();
   guideCtx.strokeStyle = overlay.stroke;
   guideCtx.fillStyle = overlay.fill;
-  guideCtx.lineWidth = 2;
-  guideCtx.setLineDash([]);
+  guideCtx.lineWidth = isManual ? 3 : 2;
+  guideCtx.setLineDash(isManual ? [10, 4] : []);
 
   if (region.type === 'polygon' && region.points?.length >= 3) {
     guideCtx.beginPath();
@@ -295,7 +357,7 @@ function drawRegionOverlay(region, overlay) {
   const labelY = region.type === 'rect' ? region.y - 6 : region.points[0].y - 6;
   guideCtx.fillStyle = overlay.stroke;
   guideCtx.font = '13px sans-serif';
-  guideCtx.fillText(overlay.label, labelX, Math.max(14, labelY));
+  guideCtx.fillText(isManual ? `${overlay.label} (fixiert)` : overlay.label, labelX, Math.max(14, labelY));
   guideCtx.restore();
 }
 
@@ -510,8 +572,9 @@ function renderOutput() {
 }
 
 function animateMouthFromDrawing(faceBox, mouthOpen) {
-  const mouthRect = avatarState.faceRegions?.mouth?.type === 'rect'
-    ? avatarState.faceRegions.mouth
+  const mouthRegion = getPreferredRegion('mouth');
+  const mouthRect = mouthRegion?.type === 'rect'
+    ? mouthRegion
     : null;
   const { x, y, w, h } = mouthRect || faceBox;
   const stripY = mouthRect ? y : y + h * 0.55;
@@ -550,4 +613,190 @@ function animateHeadBounce(faceBox, level) {
 
 function setStatus(message) {
   statusEl.textContent = message;
+}
+
+function getPreferredRegion(key) {
+  return avatarState.faceRegions?.[key] || avatarState.autoFaceRegions?.[key] || null;
+}
+
+function startRegionEdit() {
+  regionEditState.active = true;
+  regionEditState.target = regionSelect.value;
+  regionEditState.dragStart = null;
+  regionEditState.draftRect = null;
+  regionEditState.polygonPoints = [];
+  regionEditState.hoverPoint = null;
+  drawGuideCanvas.style.pointerEvents = 'auto';
+  drawRegionBtn.textContent = 'Markieren beenden';
+  setStatus(`Markierungsmodus aktiv (${getRegionLabel(regionEditState.target)}).`);
+  drawFaceGuide();
+}
+
+function stopRegionEdit(showStatus = true) {
+  regionEditState.active = false;
+  regionEditState.dragStart = null;
+  regionEditState.draftRect = null;
+  regionEditState.polygonPoints = [];
+  regionEditState.hoverPoint = null;
+  drawGuideCanvas.style.pointerEvents = 'none';
+  drawRegionBtn.textContent = 'Region zeichnen/markieren';
+  if (showStatus) setStatus('Markierungsmodus beendet.');
+  drawFaceGuide();
+}
+
+function onGuidePointerDown(event) {
+  if (!regionEditState.active) return;
+  const shape = getRegionShape(regionEditState.target);
+  const p = getPos(event, drawGuideCanvas);
+
+  if (shape === 'polygon') {
+    if (regionEditState.polygonPoints.length >= 3 && isNearPoint(p, regionEditState.polygonPoints[0])) {
+      saveManualPolygon();
+      return;
+    }
+    regionEditState.polygonPoints.push(p);
+    drawFaceGuide();
+    return;
+  }
+
+  regionEditState.dragStart = p;
+  regionEditState.draftRect = { type: 'rect', x: p.x, y: p.y, w: 1, h: 1, manual: true, estimated: false };
+  drawGuideCanvas.setPointerCapture(event.pointerId);
+}
+
+function onGuidePointerMove(event) {
+  if (!regionEditState.active) return;
+  const p = getPos(event, drawGuideCanvas);
+  const shape = getRegionShape(regionEditState.target);
+  if (shape === 'polygon') {
+    regionEditState.hoverPoint = p;
+    drawFaceGuide();
+    return;
+  }
+  if (!regionEditState.dragStart) return;
+  regionEditState.draftRect = createRectFromPoints(regionEditState.dragStart, p);
+  drawFaceGuide();
+}
+
+function onGuidePointerUp(event) {
+  if (!regionEditState.active) return;
+  if (!regionEditState.dragStart || !regionEditState.draftRect) return;
+  drawGuideCanvas.releasePointerCapture(event.pointerId);
+  if (regionEditState.draftRect.w < 4 || regionEditState.draftRect.h < 4) {
+    regionEditState.dragStart = null;
+    regionEditState.draftRect = null;
+    drawFaceGuide();
+    return;
+  }
+  avatarState.faceRegions[regionEditState.target] = {
+    ...regionEditState.draftRect,
+    manual: true,
+    estimated: false,
+  };
+  stopRegionEdit(false);
+  setStatus(`Region "${getRegionLabel(regionEditState.target)}" manuell fixiert.`);
+}
+
+function onGuideDoubleClick() {
+  if (!regionEditState.active || getRegionShape(regionEditState.target) !== 'polygon') return;
+  saveManualPolygon();
+}
+
+function saveManualPolygon() {
+  if (regionEditState.polygonPoints.length < 3) {
+    setStatus('Für Brauen mindestens 3 Punkte setzen, dann doppelklicken.');
+    return;
+  }
+  avatarState.faceRegions[regionEditState.target] = {
+    type: 'polygon',
+    points: regionEditState.polygonPoints.map((point) => ({ x: point.x, y: point.y })),
+    manual: true,
+    estimated: false,
+  };
+  stopRegionEdit(false);
+  setStatus(`Region "${getRegionLabel(regionEditState.target)}" manuell fixiert.`);
+}
+
+function drawRegionDraftOverlay() {
+  if (!regionEditState.active) return;
+  guideCtx.save();
+  guideCtx.lineWidth = 2;
+  guideCtx.strokeStyle = '#f472b6';
+  guideCtx.fillStyle = 'rgba(244, 114, 182, 0.22)';
+  guideCtx.setLineDash([6, 4]);
+
+  const shape = getRegionShape(regionEditState.target);
+  if (shape === 'polygon') {
+    const points = regionEditState.polygonPoints;
+    if (points.length) {
+      guideCtx.beginPath();
+      guideCtx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        guideCtx.lineTo(points[i].x, points[i].y);
+      }
+      if (regionEditState.hoverPoint) {
+        guideCtx.lineTo(regionEditState.hoverPoint.x, regionEditState.hoverPoint.y);
+      }
+      guideCtx.stroke();
+    }
+    points.forEach((point) => {
+      guideCtx.beginPath();
+      guideCtx.arc(point.x, point.y, 4, 0, Math.PI * 2);
+      guideCtx.fill();
+    });
+  } else if (regionEditState.draftRect) {
+    const rect = regionEditState.draftRect;
+    guideCtx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    guideCtx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+  }
+  guideCtx.restore();
+}
+
+function getRegionShape(regionKey) {
+  return regionKey === 'brows' ? 'polygon' : 'rect';
+}
+
+function createRectFromPoints(start, end) {
+  const x = Math.min(start.x, end.x);
+  const y = Math.min(start.y, end.y);
+  const w = Math.max(1, Math.abs(end.x - start.x));
+  const h = Math.max(1, Math.abs(end.y - start.y));
+  return { type: 'rect', x, y, w, h, manual: true, estimated: false };
+}
+
+function isNearPoint(a, b, threshold = 10) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy) <= threshold;
+}
+
+function toManualRegion(region) {
+  if (region.type === 'polygon') {
+    return {
+      type: 'polygon',
+      points: region.points.map((point) => ({ x: point.x, y: point.y })),
+      manual: true,
+      estimated: false,
+    };
+  }
+  return {
+    type: 'rect',
+    x: region.x,
+    y: region.y,
+    w: region.w,
+    h: region.h,
+    manual: true,
+    estimated: false,
+  };
+}
+
+function getRegionLabel(key) {
+  return (
+    {
+      mouth: 'Mund',
+      leftEye: 'linkes Auge',
+      rightEye: 'rechtes Auge',
+      brows: 'Brauen',
+    }[key] || key
+  );
 }

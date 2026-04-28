@@ -35,6 +35,20 @@
         <p id="status" class="status">
           Zeichne links deinen Avatar. Danach "Gesicht erkennen" und "In Output übernehmen".
         </p>
+
+        <section class="region-tools" aria-label="Regionen zuweisen">
+          <h2>Regionen zuweisen</h2>
+          <label for="regionSelect">Zielregion</label>
+          <select id="regionSelect">
+            <option value="mouth">Mund</option>
+            <option value="leftEye">linkes Auge</option>
+            <option value="rightEye">rechtes Auge</option>
+            <option value="brows">Brauen</option>
+          </select>
+          <button id="drawRegionBtn" type="button">Region zeichnen/markieren</button>
+          <button id="adoptRegionBtn" type="button">Erkannte Region übernehmen</button>
+          <button id="resetRegionBtn" type="button">Zurücksetzen</button>
+        </section>
       </section>
 
       <section class="stage" aria-label="Zeichen- und Output-Flächen">
