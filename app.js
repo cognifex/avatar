@@ -560,7 +560,9 @@ function renderOutput() {
     outputCtx.putImageData(avatarState.baseFrame, 0, 0);
 
     if (avatarState.faceBox && audioState.mouthOpen > 0.01) {
-      animateMouthFromDrawing(avatarState.faceBox, audioState.mouthOpen);
+      const mouthRegion = resolveMouthRegion(avatarState.faceBox);
+      const visemeState = classifyVisemeState(audioState.mouthOpen, audioState.pitchHz);
+      animateMouthFromRegion(mouthRegion, visemeState);
     }
 
     if (avatarState.faceBox && audioState.level > 0.08) {
@@ -571,32 +573,171 @@ function renderOutput() {
   renderId = requestAnimationFrame(renderOutput);
 }
 
-function animateMouthFromDrawing(faceBox, mouthOpen) {
-  const mouthRegion = getPreferredRegion('mouth');
-  const mouthRect = mouthRegion?.type === 'rect'
-    ? mouthRegion
-    : null;
-  const { x, y, w, h } = mouthRect || faceBox;
-  const stripY = mouthRect ? y : y + h * 0.55;
-  const stripH = mouthRect ? h : h * 0.33;
+function animateMouthFromRegion(mouthRegion, visemeState) {
+  if (!mouthRegion) return;
+  const bounds = getRegionBounds(mouthRegion);
+  if (!bounds) return;
+  const srcAnchors = buildMouthAnchors(bounds);
+  const dstAnchors = deformMouthAnchors(srcAnchors, bounds, visemeState);
 
   bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
   bufferCtx.drawImage(outputCanvas, 0, 0);
 
-  outputCtx.clearRect(x - 2, stripY - 2, w + 4, stripH + h * 0.25 + 4);
+  outputCtx.save();
+  traceRegionPath(outputCtx, mouthRegion);
+  outputCtx.clip();
+  outputCtx.clearRect(bounds.x - 2, bounds.y - 2, bounds.w + 4, bounds.h + 4);
 
-  const expandedH = stripH * (1 + mouthOpen * 0.9);
-  outputCtx.drawImage(
-    bufferCanvas,
-    x,
-    stripY,
-    w,
-    stripH,
-    x,
-    stripY,
-    w,
-    expandedH,
+  const triangles = [
+    ['tl', 'upperMid', 'leftCorner'],
+    ['tl', 'tr', 'upperMid'],
+    ['tr', 'rightCorner', 'upperMid'],
+    ['tr', 'br', 'rightCorner'],
+    ['br', 'lowerMid', 'rightCorner'],
+    ['br', 'bl', 'lowerMid'],
+    ['bl', 'leftCorner', 'lowerMid'],
+    ['bl', 'tl', 'leftCorner'],
+    ['leftCorner', 'upperMid', 'center'],
+    ['upperMid', 'rightCorner', 'center'],
+    ['rightCorner', 'lowerMid', 'center'],
+    ['lowerMid', 'leftCorner', 'center'],
+  ];
+
+  triangles.forEach((triangle) => {
+    const srcTri = triangle.map((key) => srcAnchors[key]);
+    const dstTri = triangle.map((key) => dstAnchors[key]);
+    warpTriangle(bufferCanvas, outputCtx, srcTri, dstTri);
+  });
+
+  outputCtx.restore();
+}
+
+function resolveMouthRegion(faceBox) {
+  const mouthRegion = getPreferredRegion('mouth');
+  if (mouthRegion) return mouthRegion;
+  return {
+    type: 'rect',
+    x: faceBox.x,
+    y: faceBox.y + faceBox.h * 0.55,
+    w: faceBox.w,
+    h: faceBox.h * 0.33,
+    estimated: true,
+  };
+}
+
+function classifyVisemeState(mouthOpen, pitchHz) {
+  if (mouthOpen < 0.12) return 'Closed';
+  if (mouthOpen < 0.3) return 'Open';
+  if (pitchHz > 210) return 'Wide';
+  if (pitchHz > 0 && pitchHz < 150) return 'Round';
+  return 'Open';
+}
+
+function getRegionBounds(region) {
+  if (region?.type === 'rect') return region;
+  if (region?.type !== 'polygon' || !region.points?.length) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  region.points.forEach((point) => {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  });
+  if (!Number.isFinite(minX)) return null;
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+function traceRegionPath(ctx, region) {
+  ctx.beginPath();
+  if (region.type === 'polygon' && region.points?.length >= 3) {
+    ctx.moveTo(region.points[0].x, region.points[0].y);
+    for (let i = 1; i < region.points.length; i++) {
+      ctx.lineTo(region.points[i].x, region.points[i].y);
+    }
+    ctx.closePath();
+    return;
+  }
+  ctx.rect(region.x, region.y, region.w, region.h);
+}
+
+function buildMouthAnchors(bounds) {
+  const { x, y, w, h } = bounds;
+  return {
+    tl: { x, y },
+    tr: { x: x + w, y },
+    br: { x: x + w, y: y + h },
+    bl: { x, y: y + h },
+    leftCorner: { x: x + w * 0.2, y: y + h * 0.56 },
+    rightCorner: { x: x + w * 0.8, y: y + h * 0.56 },
+    upperMid: { x: x + w * 0.5, y: y + h * 0.42 },
+    lowerMid: { x: x + w * 0.5, y: y + h * 0.72 },
+    center: { x: x + w * 0.5, y: y + h * 0.57 },
+  };
+}
+
+function deformMouthAnchors(anchors, bounds, visemeState) {
+  const deformed = Object.fromEntries(
+    Object.entries(anchors).map(([key, point]) => [key, { x: point.x, y: point.y }]),
   );
+  const { w, h } = bounds;
+
+  if (visemeState === 'Closed') {
+    deformed.leftCorner.x += w * 0.03;
+    deformed.rightCorner.x -= w * 0.03;
+    deformed.upperMid.y += h * 0.06;
+    deformed.lowerMid.y -= h * 0.1;
+  } else if (visemeState === 'Wide') {
+    deformed.leftCorner.x -= w * 0.11;
+    deformed.rightCorner.x += w * 0.11;
+    deformed.upperMid.y -= h * 0.04;
+    deformed.lowerMid.y += h * 0.1;
+  } else if (visemeState === 'Round') {
+    deformed.leftCorner.x += w * 0.09;
+    deformed.rightCorner.x -= w * 0.09;
+    deformed.upperMid.y -= h * 0.02;
+    deformed.lowerMid.y += h * 0.12;
+  } else {
+    deformed.upperMid.y -= h * 0.09;
+    deformed.lowerMid.y += h * 0.2;
+  }
+
+  deformed.center.x = (deformed.leftCorner.x + deformed.rightCorner.x) / 2;
+  deformed.center.y = (deformed.upperMid.y + deformed.lowerMid.y) / 2;
+  return deformed;
+}
+
+function warpTriangle(sourceCanvas, targetCtx, srcTri, dstTri) {
+  const transform = affineFromTriangles(srcTri, dstTri);
+  if (!transform) return;
+  targetCtx.save();
+  targetCtx.beginPath();
+  targetCtx.moveTo(dstTri[0].x, dstTri[0].y);
+  targetCtx.lineTo(dstTri[1].x, dstTri[1].y);
+  targetCtx.lineTo(dstTri[2].x, dstTri[2].y);
+  targetCtx.closePath();
+  targetCtx.clip();
+  targetCtx.setTransform(transform.a, transform.b, transform.c, transform.d, transform.e, transform.f);
+  targetCtx.drawImage(sourceCanvas, 0, 0);
+  targetCtx.restore();
+}
+
+function affineFromTriangles(srcTri, dstTri) {
+  const [p1, p2, p3] = srcTri;
+  const [q1, q2, q3] = dstTri;
+  const det = p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y);
+  if (Math.abs(det) < 1e-6) return null;
+
+  const a = (q1.x * (p2.y - p3.y) + q2.x * (p3.y - p1.y) + q3.x * (p1.y - p2.y)) / det;
+  const b = (q1.y * (p2.y - p3.y) + q2.y * (p3.y - p1.y) + q3.y * (p1.y - p2.y)) / det;
+  const c = (q1.x * (p3.x - p2.x) + q2.x * (p1.x - p3.x) + q3.x * (p2.x - p1.x)) / det;
+  const d = (q1.y * (p3.x - p2.x) + q2.y * (p1.x - p3.x) + q3.y * (p2.x - p1.x)) / det;
+  const e = (q1.x * (p2.x * p3.y - p3.x * p2.y) + q2.x * (p3.x * p1.y - p1.x * p3.y) + q3.x * (p1.x * p2.y - p2.x * p1.y)) / det;
+  const f = (q1.y * (p2.x * p3.y - p3.x * p2.y) + q2.y * (p3.x * p1.y - p1.x * p3.y) + q3.y * (p1.x * p2.y - p2.x * p1.y)) / det;
+
+  return { a, b, c, d, e, f };
 }
 
 function animateHeadBounce(faceBox, level) {
