@@ -26,6 +26,16 @@
           <button id="micBtn" type="button">Mikrofon starten</button>
           <button id="stopMicBtn" type="button" disabled>Mikrofon stoppen</button>
         </div>
+        <div class="toolbar">
+          <label>
+            Sensitivity
+            <input id="sensitivityInput" type="range" min="0.6" max="2.2" step="0.05" value="1" />
+          </label>
+          <label>
+            Latency
+            <input id="latencyInput" type="range" min="0" max="1" step="0.01" value="0.35" />
+          </label>
+        </div>
 
         <label class="toggle">
           <input id="transparentBg" type="checkbox" />

@@ -8,6 +8,8 @@ const detectBtn = document.getElementById('detectBtn');
 const copyBtn = document.getElementById('copyBtn');
 const micBtn = document.getElementById('micBtn');
 const stopMicBtn = document.getElementById('stopMicBtn');
+const sensitivityInput = document.getElementById('sensitivityInput');
+const latencyInput = document.getElementById('latencyInput');
 const regionSelect = document.getElementById('regionSelect');
 const drawRegionBtn = document.getElementById('drawRegionBtn');
 const adoptRegionBtn = document.getElementById('adoptRegionBtn');
@@ -35,7 +37,22 @@ let renderId;
 const audioState = {
   level: 0,
   pitchHz: 0,
-  mouthOpen: 0,
+  visemeWeights: {
+    closed: 1,
+    open: 0,
+    wide: 0,
+    round: 0,
+    fv: 0,
+  },
+  featureState: {
+    energy: 0,
+    lowBand: 0,
+    midBand: 0,
+    highBand: 0,
+    centroidNorm: 0,
+    zeroCrossNorm: 0,
+  },
+  visemeHoldUntil: 0,
 };
 
 const avatarState = {
@@ -488,18 +505,30 @@ async function startMic() {
   source.connect(analyser);
 
   const timeData = new Float32Array(analyser.fftSize);
+  const freqData = new Float32Array(analyser.frequencyBinCount);
 
   const loop = () => {
     analyser.getFloatTimeDomainData(timeData);
+    analyser.getFloatFrequencyData(freqData);
 
-    const rms = Math.sqrt(timeData.reduce((acc, v) => acc + v * v, 0) / timeData.length);
-    audioState.level = smooth(audioState.level, rms, 0.25);
+    const features = extractFrameFeatures(timeData, freqData, audioCtx.sampleRate);
+    const sensitivity = Number(sensitivityInput?.value || 1);
+    const latency = Number(latencyInput?.value || 0.35);
+    audioState.level = smoothWithLatency(audioState.level, features.energy, latency);
 
     const pitch = estimatePitch(timeData, audioCtx.sampleRate);
-    audioState.pitchHz = smooth(audioState.pitchHz, pitch, 0.2);
+    audioState.pitchHz = smoothWithLatency(audioState.pitchHz, pitch, latency * 0.8);
+    audioState.featureState = {
+      energy: smoothWithLatency(audioState.featureState.energy, features.energy, latency),
+      lowBand: smoothWithLatency(audioState.featureState.lowBand, features.bands.low, latency),
+      midBand: smoothWithLatency(audioState.featureState.midBand, features.bands.mid, latency),
+      highBand: smoothWithLatency(audioState.featureState.highBand, features.bands.high, latency),
+      centroidNorm: smoothWithLatency(audioState.featureState.centroidNorm, features.centroidNorm, latency),
+      zeroCrossNorm: smoothWithLatency(audioState.featureState.zeroCrossNorm, features.zeroCrossNorm, latency),
+    };
 
-    const pulse = Math.abs(Math.sin(performance.now() / 95));
-    audioState.mouthOpen = Math.min(1, audioState.level * 18) * (0.55 + 0.45 * pulse);
+    const targetVisemes = deriveVisemeWeights(audioState.featureState, audioState.pitchHz, sensitivity);
+    audioState.visemeWeights = smoothVisemeWeights(audioState.visemeWeights, targetVisemes, latency, audioState);
 
     audioLoopId = requestAnimationFrame(loop);
   };
@@ -524,7 +553,9 @@ function stopMic() {
   analyser = null;
   audioState.level = 0;
   audioState.pitchHz = 0;
-  audioState.mouthOpen = 0;
+  audioState.visemeWeights = { closed: 1, open: 0, wide: 0, round: 0, fv: 0 };
+  audioState.featureState = { energy: 0, lowBand: 0, midBand: 0, highBand: 0, centroidNorm: 0, zeroCrossNorm: 0 };
+  audioState.visemeHoldUntil = 0;
 }
 
 function estimatePitch(samples, sampleRate) {
@@ -553,16 +584,125 @@ function smooth(prev, next, alpha) {
   return prev + alpha * (next - prev);
 }
 
+function smoothWithLatency(prev, next, latencyNorm) {
+  const clamped = clamp(latencyNorm, 0, 1);
+  const alpha = 0.42 - clamped * 0.32;
+  return smooth(prev, next, alpha);
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function extractFrameFeatures(timeData, freqData, sampleRate) {
+  const energy = Math.sqrt(timeData.reduce((acc, v) => acc + v * v, 0) / timeData.length);
+  let zeroCrossings = 0;
+  for (let i = 1; i < timeData.length; i++) {
+    if ((timeData[i - 1] >= 0 && timeData[i] < 0) || (timeData[i - 1] < 0 && timeData[i] >= 0)) zeroCrossings++;
+  }
+  const zeroCrossNorm = clamp(zeroCrossings / (timeData.length * 0.26), 0, 1);
+
+  const nyquist = sampleRate / 2;
+  const binHz = nyquist / freqData.length;
+  let totalMag = 0;
+  let centroidNum = 0;
+  let low = 0;
+  let mid = 0;
+  let high = 0;
+
+  for (let i = 0; i < freqData.length; i++) {
+    const mag = Number.isFinite(freqData[i]) ? Math.pow(10, freqData[i] / 20) : 0;
+    const hz = i * binHz;
+    totalMag += mag;
+    centroidNum += mag * hz;
+    if (hz < 500) low += mag;
+    else if (hz < 2500) mid += mag;
+    else high += mag;
+  }
+
+  const invTotal = 1 / Math.max(1e-6, totalMag);
+  const centroidNorm = clamp((centroidNum * invTotal) / 4200, 0, 1);
+  return {
+    energy: clamp(energy * 6, 0, 1),
+    zeroCrossNorm,
+    centroidNorm,
+    bands: {
+      low: clamp((low * invTotal) * 2.2, 0, 1),
+      mid: clamp((mid * invTotal) * 2.2, 0, 1),
+      high: clamp((high * invTotal) * 3.1, 0, 1),
+    },
+  };
+}
+
+function deriveVisemeWeights(features, pitchHz, sensitivity) {
+  const sens = clamp(sensitivity, 0.6, 2.2);
+  const voicedEnergy = clamp(features.energy * sens, 0, 1);
+  const low = features.lowBand;
+  const mid = features.midBand;
+  const high = features.highBand;
+  const centroid = features.centroidNorm;
+  const zc = features.zeroCrossNorm;
+
+  const open = clamp((voicedEnergy - 0.14) * 1.35 + (mid - 0.28) * 0.6, 0, 1);
+  const wide = clamp(open * (centroid - 0.2) * 1.6 + clamp((pitchHz - 185) / 180, 0, 1) * 0.5, 0, 1);
+  const round = clamp(open * (low - high * 0.55) * 1.55 + clamp((170 - pitchHz) / 170, 0, 1) * 0.3, 0, 1);
+  const fv = clamp((high * 1.55 + zc * 0.8 - 0.58) * 1.35 * (0.55 + voicedEnergy * 0.6), 0, 1);
+
+  const openLike = Math.max(open * 0.9, wide * 0.6, round * 0.58, fv * 0.42);
+  const closed = clamp(1 - openLike * 1.2 - voicedEnergy * 0.3, 0, 1);
+
+  return normalizeVisemeWeights({ closed, open, wide, round, fv });
+}
+
+function normalizeVisemeWeights(weights) {
+  const clean = {
+    closed: clamp(weights.closed || 0, 0, 1),
+    open: clamp(weights.open || 0, 0, 1),
+    wide: clamp(weights.wide || 0, 0, 1),
+    round: clamp(weights.round || 0, 0, 1),
+    fv: clamp(weights.fv || 0, 0, 1),
+  };
+  const sum = clean.closed + clean.open + clean.wide + clean.round + clean.fv;
+  if (sum < 1e-5) return { closed: 1, open: 0, wide: 0, round: 0, fv: 0 };
+  return {
+    closed: clean.closed / sum,
+    open: clean.open / sum,
+    wide: clean.wide / sum,
+    round: clean.round / sum,
+    fv: clean.fv / sum,
+  };
+}
+
+function smoothVisemeWeights(current, target, latency, state) {
+  const now = performance.now();
+  const attack = 0.42 - latency * 0.3;
+  const release = 0.16 - latency * 0.1;
+  const holdMs = 42 + latency * 120;
+
+  const hasStrongOpen = target.open > 0.22 || target.wide > 0.16 || target.round > 0.16 || target.fv > 0.2;
+  if (hasStrongOpen) state.visemeHoldUntil = now + holdMs;
+  const holdActive = now < state.visemeHoldUntil;
+
+  const next = {};
+  ['closed', 'open', 'wide', 'round', 'fv'].forEach((key) => {
+    const prev = current[key] ?? (key === 'closed' ? 1 : 0);
+    let desired = target[key] ?? 0;
+    if (holdActive && key === 'closed') desired = Math.min(desired, prev);
+    const alpha = desired > prev ? attack : release;
+    next[key] = smooth(prev, desired, clamp(alpha, 0.03, 0.9));
+  });
+  return normalizeVisemeWeights(next);
+}
+
 function renderOutput() {
   outputCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
 
   if (avatarState.baseFrame) {
     outputCtx.putImageData(avatarState.baseFrame, 0, 0);
 
-    if (avatarState.faceBox && audioState.mouthOpen > 0.01) {
+    if (avatarState.faceBox) {
       const mouthRegion = resolveMouthRegion(avatarState.faceBox);
-      const visemeState = classifyVisemeState(audioState.mouthOpen, audioState.pitchHz);
-      animateMouthFromRegion(mouthRegion, visemeState);
+      animateMouthFromRegion(mouthRegion, audioState.visemeWeights);
     }
 
     if (avatarState.faceBox && audioState.level > 0.08) {
@@ -573,12 +713,12 @@ function renderOutput() {
   renderId = requestAnimationFrame(renderOutput);
 }
 
-function animateMouthFromRegion(mouthRegion, visemeState) {
+function animateMouthFromRegion(mouthRegion, visemeWeights) {
   if (!mouthRegion) return;
   const bounds = getRegionBounds(mouthRegion);
   if (!bounds) return;
   const srcAnchors = buildMouthAnchors(bounds);
-  const dstAnchors = deformMouthAnchors(srcAnchors, bounds, visemeState);
+  const dstAnchors = deformMouthAnchors(srcAnchors, bounds, visemeWeights);
 
   bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
   bufferCtx.drawImage(outputCanvas, 0, 0);
@@ -623,14 +763,6 @@ function resolveMouthRegion(faceBox) {
     h: faceBox.h * 0.33,
     estimated: true,
   };
-}
-
-function classifyVisemeState(mouthOpen, pitchHz) {
-  if (mouthOpen < 0.12) return 'Closed';
-  if (mouthOpen < 0.3) return 'Open';
-  if (pitchHz > 210) return 'Wide';
-  if (pitchHz > 0 && pitchHz < 150) return 'Round';
-  return 'Open';
 }
 
 function getRegionBounds(region) {
@@ -678,31 +810,21 @@ function buildMouthAnchors(bounds) {
   };
 }
 
-function deformMouthAnchors(anchors, bounds, visemeState) {
+function deformMouthAnchors(anchors, bounds, visemeWeights) {
   const deformed = Object.fromEntries(
     Object.entries(anchors).map(([key, point]) => [key, { x: point.x, y: point.y }]),
   );
   const { w, h } = bounds;
+  const closed = visemeWeights?.closed ?? 1;
+  const open = visemeWeights?.open ?? 0;
+  const wide = visemeWeights?.wide ?? 0;
+  const round = visemeWeights?.round ?? 0;
+  const fv = visemeWeights?.fv ?? 0;
 
-  if (visemeState === 'Closed') {
-    deformed.leftCorner.x += w * 0.03;
-    deformed.rightCorner.x -= w * 0.03;
-    deformed.upperMid.y += h * 0.06;
-    deformed.lowerMid.y -= h * 0.1;
-  } else if (visemeState === 'Wide') {
-    deformed.leftCorner.x -= w * 0.11;
-    deformed.rightCorner.x += w * 0.11;
-    deformed.upperMid.y -= h * 0.04;
-    deformed.lowerMid.y += h * 0.1;
-  } else if (visemeState === 'Round') {
-    deformed.leftCorner.x += w * 0.09;
-    deformed.rightCorner.x -= w * 0.09;
-    deformed.upperMid.y -= h * 0.02;
-    deformed.lowerMid.y += h * 0.12;
-  } else {
-    deformed.upperMid.y -= h * 0.09;
-    deformed.lowerMid.y += h * 0.2;
-  }
+  deformed.leftCorner.x += w * (closed * 0.03 - wide * 0.11 + round * 0.09 + fv * 0.02);
+  deformed.rightCorner.x += w * (-closed * 0.03 + wide * 0.11 - round * 0.09 - fv * 0.06);
+  deformed.upperMid.y += h * (closed * 0.06 - open * 0.09 - wide * 0.04 - round * 0.02 + fv * 0.07);
+  deformed.lowerMid.y += h * (-closed * 0.1 + open * 0.2 + wide * 0.1 + round * 0.12 + fv * 0.02);
 
   deformed.center.x = (deformed.leftCorner.x + deformed.rightCorner.x) / 2;
   deformed.center.y = (deformed.upperMid.y + deformed.lowerMid.y) / 2;
