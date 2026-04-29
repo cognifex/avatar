@@ -3,139 +3,41 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Avatar Audio Canvas Tool</title>
+    <title>Deadpan Comedy Avatar v1</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <main class="app">
-      <section class="controls">
-        <h1>Avatar Canvas für Streaming</h1>
-        <p>
-          Links zeichnen, Gesicht erkennen und rechts den Live-Output sehen.
-          Der neutrale Ausdruck im Output bleibt exakt dein gezeichnetes Gesicht.
-        </p>
+      <aside class="panel">
+        <h1>Deadpan Comedy Avatar v1</h1>
+        <p>Minimaler 2D-Avatar mit Webcam-Tracking, Peak-Engine und OBS-tauglichem Output.</p>
 
-        <div class="toolbar">
-          <label>
-            Pinselgröße
-            <input id="brushSize" type="range" min="1" max="24" value="4" />
-          </label>
-          <button id="clearBtn" type="button">Zeichnung löschen</button>
-          <button id="detectBtn" type="button">Gesicht erkennen</button>
-          <button id="copyBtn" type="button">In Output übernehmen</button>
-          <button id="micBtn" type="button">Mikrofon starten</button>
-          <button id="stopMicBtn" type="button" disabled>Mikrofon stoppen</button>
-        </div>
-        <div class="toolbar">
-          <label>
-            Profil
-            <select id="profileSelect">
-              <option value="natural">Natural</option>
-              <option value="energetic">Energetic</option>
-              <option value="cartoon">Cartoon</option>
+        <div class="group">
+          <button id="startCameraBtn">Kamera starten</button>
+          <button id="calibrateBtn">2s neutral kalibrieren</button>
+          <label>Style-Profil
+            <select id="styleProfile">
+              <option value="deadpan">Deadpan</option>
+              <option value="balanced">Balanced</option>
+              <option value="overreact">Overreact</option>
             </select>
           </label>
-          <label>
-            Sensitivity
-            <input id="sensitivityInput" type="range" min="0.6" max="2.2" step="0.05" value="1" />
-          </label>
-          <label>
-            Latency
-            <input id="latencyInput" type="range" min="0" max="1" step="0.01" value="0.35" />
-          </label>
-        </div>
-        <div class="toolbar">
-          <label>
-            Responsiveness
-            <input id="responsivenessInput" type="range" min="0" max="1" step="0.01" value="0.5" />
-          </label>
-          <label>
-            Expressiveness
-            <input id="expressivenessInput" type="range" min="0" max="1" step="0.01" value="0.5" />
-          </label>
-        </div>
-        <div class="toolbar">
-          <button id="trackingToggleBtn" type="button">Face Tracking: On</button>
-          <button id="startCameraBtn" type="button">Kamera starten</button>
-          <button id="calibrateTrackingBtn" type="button">Kalibrieren</button>
-          <label>
-            Kamera
-            <select id="cameraDeviceSelect">
-              <option value="">Standardkamera</option>
-            </select>
-          </label>
-          <label>
-            Modus
-            <select id="modeSelect">
-              <option value="tracking_audio">Tracking + Audio</option>
-              <option value="audio_only">Audio only</option>
-            </select>
-          </label>
-          <label class="toggle">
-            <input id="debugOverlayToggle" type="checkbox" />
-            Debug-Overlay
-          </label>
-        </div>
-        <div class="toolbar">
-          <label>
-            Tracking Smoothness
-            <input id="trackingSmoothnessInput" type="range" min="0" max="1" step="0.01" value="0.55" />
-          </label>
-          <label>
-            Tracking Responsiveness
-            <input id="trackingResponsivenessInput" type="range" min="0" max="1" step="0.01" value="0.5" />
-          </label>
+          <label class="toggle"><input id="transparentToggle" type="checkbox" checked /> Transparenter Output</label>
         </div>
 
-        <label class="toggle">
-          <input id="transparentBg" type="checkbox" />
-          Transparenter Output-Hintergrund (OBS)
-        </label>
-        <label class="toggle">
-          <input id="expressiveMotionToggle" type="checkbox" checked />
-          Expressive Motion
-        </label>
+        <div class="group">
+          <strong>Status</strong>
+          <p id="status">No Camera</p>
+          <small>States: No Camera · Low Light / Face Lost · Tracking OK · Live</small>
+        </div>
+      </aside>
 
-        <p id="status" class="status">
-          Zeichne links deinen Avatar. Danach "Gesicht erkennen" und "In Output übernehmen".
-        </p>
-
-        <section class="region-tools" aria-label="Regionen zuweisen">
-          <h2>Regionen zuweisen</h2>
-          <label for="regionSelect">Zielregion</label>
-          <select id="regionSelect">
-            <option value="mouth">Mund</option>
-            <option value="leftEye">linkes Auge</option>
-            <option value="rightEye">rechtes Auge</option>
-            <option value="brows">Brauen</option>
-          </select>
-          <button id="drawRegionBtn" type="button">Region zeichnen/markieren</button>
-          <button id="adoptRegionBtn" type="button">Erkannte Region übernehmen</button>
-          <button id="resetRegionBtn" type="button">Zurücksetzen</button>
-        </section>
+      <section class="stage">
+        <video id="camera" autoplay playsinline muted></video>
+        <canvas id="avatar" width="960" height="540"></canvas>
       </section>
-
-      <section class="stage" aria-label="Zeichen- und Output-Flächen">
-        <article>
-          <h2>Zeichen-Canvas</h2>
-          <div class="canvas-wrap" id="drawWrap">
-            <canvas id="drawCanvas" width="960" height="540"></canvas>
-            <canvas id="drawGuideCanvas" width="960" height="540"></canvas>
-          </div>
-        </article>
-
-        <article>
-          <h2>Output-Canvas (OBS)</h2>
-          <div class="canvas-wrap" id="outputWrap">
-            <canvas id="outputCanvas" width="960" height="540"></canvas>
-          </div>
-        </article>
-      </section>
-      <video id="trackingVideo" autoplay playsinline muted hidden></video>
-      <canvas id="trackingDebugCanvas" width="320" height="180" hidden></canvas>
     </main>
 
-    <script src="expressions.js"></script>
-    <script src="app.js"></script>
+    <script type="module" src="app.js"></script>
   </body>
 </html>
