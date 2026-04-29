@@ -785,18 +785,30 @@ function animateMouthFromRegion(mouthRegion, visemeWeights) {
   outputCtx.clearRect(bounds.x - 2, bounds.y - 2, bounds.w + 4, bounds.h + 4);
 
   const triangles = [
-    ['tl', 'upperMid', 'leftCorner'],
+    ['tl', 'upperLeft', 'leftCorner'],
+    ['tl', 'upperMid', 'upperLeft'],
     ['tl', 'tr', 'upperMid'],
-    ['tr', 'rightCorner', 'upperMid'],
-    ['tr', 'br', 'rightCorner'],
-    ['br', 'lowerMid', 'rightCorner'],
-    ['br', 'bl', 'lowerMid'],
-    ['bl', 'leftCorner', 'lowerMid'],
+    ['tr', 'upperRight', 'upperMid'],
+    ['tr', 'rightCorner', 'upperRight'],
+    ['leftCorner', 'upperLeft', 'innerUpperMid'],
+    ['upperLeft', 'upperMid', 'innerUpperMid'],
+    ['upperMid', 'upperRight', 'innerUpperMid'],
+    ['upperRight', 'rightCorner', 'innerUpperMid'],
+    ['leftCorner', 'innerUpperMid', 'center'],
+    ['innerUpperMid', 'rightCorner', 'center'],
+    ['leftCorner', 'center', 'innerLowerMid'],
+    ['center', 'rightCorner', 'innerLowerMid'],
+    ['leftCorner', 'innerLowerMid', 'lowerLeft'],
+    ['innerLowerMid', 'lowerMid', 'lowerLeft'],
+    ['lowerMid', 'innerLowerMid', 'lowerRight'],
+    ['innerLowerMid', 'rightCorner', 'lowerRight'],
+    ['bl', 'leftCorner', 'lowerLeft'],
+    ['bl', 'lowerLeft', 'lowerMid'],
+    ['bl', 'lowerMid', 'br'],
+    ['br', 'lowerMid', 'lowerRight'],
+    ['br', 'lowerRight', 'rightCorner'],
     ['bl', 'tl', 'leftCorner'],
-    ['leftCorner', 'upperMid', 'center'],
-    ['upperMid', 'rightCorner', 'center'],
-    ['rightCorner', 'lowerMid', 'center'],
-    ['lowerMid', 'leftCorner', 'center'],
+    ['tr', 'br', 'rightCorner'],
   ];
 
   triangles.forEach((triangle) => {
@@ -860,8 +872,14 @@ function buildMouthAnchors(bounds) {
     bl: { x, y: y + h },
     leftCorner: { x: x + w * 0.2, y: y + h * 0.56 },
     rightCorner: { x: x + w * 0.8, y: y + h * 0.56 },
+    upperLeft: { x: x + w * 0.34, y: y + h * 0.45 },
     upperMid: { x: x + w * 0.5, y: y + h * 0.42 },
+    upperRight: { x: x + w * 0.66, y: y + h * 0.45 },
+    lowerLeft: { x: x + w * 0.34, y: y + h * 0.7 },
     lowerMid: { x: x + w * 0.5, y: y + h * 0.72 },
+    lowerRight: { x: x + w * 0.66, y: y + h * 0.7 },
+    innerUpperMid: { x: x + w * 0.5, y: y + h * 0.5 },
+    innerLowerMid: { x: x + w * 0.5, y: y + h * 0.64 },
     center: { x: x + w * 0.5, y: y + h * 0.57 },
   };
 }
@@ -877,13 +895,39 @@ function deformMouthAnchors(anchors, bounds, visemeWeights) {
   const round = visemeWeights?.round ?? 0;
   const fv = visemeWeights?.fv ?? 0;
 
-  deformed.leftCorner.x += w * (closed * 0.03 - wide * 0.11 + round * 0.09 + fv * 0.02);
-  deformed.rightCorner.x += w * (-closed * 0.03 + wide * 0.11 - round * 0.09 - fv * 0.06);
-  deformed.upperMid.y += h * (closed * 0.06 - open * 0.09 - wide * 0.04 - round * 0.02 + fv * 0.07);
-  deformed.lowerMid.y += h * (-closed * 0.1 + open * 0.2 + wide * 0.1 + round * 0.12 + fv * 0.02);
+  // Viseme coefficient table (dx = horizontal width units, dy = vertical height units)
+  // open  -> jaw drop + slight corner spread
+  // wide  -> corners move outward, reduced vertical opening
+  // round -> stronger horizontal pull-in + vertical compression
+  // fv    -> targeted upper/lower lip compression and subtle asymmetry
+  // closed-> stabilizes neutral closure and lip contact
+  const visemeProfiles = {
+    leftCorner: { dx: { closed: 0.024, open: -0.018, wide: -0.15, round: 0.145, fv: 0.015 }, dy: { closed: 0.016, open: 0.01, wide: -0.008, round: -0.02, fv: 0.022 }, clampX: 0.18, clampY: 0.11 },
+    rightCorner: { dx: { closed: -0.024, open: 0.018, wide: 0.15, round: -0.145, fv: -0.015 }, dy: { closed: 0.016, open: 0.01, wide: -0.008, round: -0.02, fv: 0.022 }, clampX: 0.18, clampY: 0.11 },
+    upperLeft: { dx: { closed: 0.006, open: -0.012, wide: -0.04, round: 0.048, fv: 0.026 }, dy: { closed: 0.026, open: -0.05, wide: 0.006, round: 0.052, fv: 0.096 }, clampX: 0.1, clampY: 0.14 },
+    upperMid: { dx: { closed: 0, open: 0, wide: 0, round: 0, fv: 0 }, dy: { closed: 0.058, open: -0.1, wide: 0.012, round: 0.078, fv: 0.122 }, clampX: 0.06, clampY: 0.16 },
+    upperRight: { dx: { closed: -0.006, open: 0.012, wide: 0.04, round: -0.048, fv: -0.026 }, dy: { closed: 0.026, open: -0.05, wide: 0.006, round: 0.052, fv: 0.096 }, clampX: 0.1, clampY: 0.14 },
+    lowerLeft: { dx: { closed: 0.006, open: -0.012, wide: -0.035, round: 0.046, fv: 0.02 }, dy: { closed: -0.046, open: 0.152, wide: 0.016, round: -0.06, fv: -0.098 }, clampX: 0.1, clampY: 0.18 },
+    lowerMid: { dx: { closed: 0, open: 0, wide: 0, round: 0, fv: 0 }, dy: { closed: -0.094, open: 0.228, wide: 0.052, round: -0.082, fv: -0.128 }, clampX: 0.06, clampY: 0.22 },
+    lowerRight: { dx: { closed: -0.006, open: 0.012, wide: 0.035, round: -0.046, fv: -0.02 }, dy: { closed: -0.046, open: 0.152, wide: 0.016, round: -0.06, fv: -0.098 }, clampX: 0.1, clampY: 0.18 },
+    innerUpperMid: { dx: { closed: 0, open: 0, wide: 0, round: 0, fv: 0 }, dy: { closed: 0.042, open: -0.082, wide: 0.004, round: 0.072, fv: 0.11 }, clampX: 0.05, clampY: 0.16 },
+    innerLowerMid: { dx: { closed: 0, open: 0, wide: 0, round: 0, fv: 0 }, dy: { closed: -0.062, open: 0.166, wide: 0.034, round: -0.078, fv: -0.112 }, clampX: 0.05, clampY: 0.18 },
+  };
 
-  deformed.center.x = (deformed.leftCorner.x + deformed.rightCorner.x) / 2;
-  deformed.center.y = (deformed.upperMid.y + deformed.lowerMid.y) / 2;
+  const weights = { closed, open, wide, round, fv };
+  Object.entries(visemeProfiles).forEach(([key, profile]) => {
+    if (!deformed[key]) return;
+    const base = anchors[key];
+    const dx = Object.entries(profile.dx).reduce((sum, [viseme, factor]) => sum + weights[viseme] * factor, 0);
+    const dy = Object.entries(profile.dy).reduce((sum, [viseme, factor]) => sum + weights[viseme] * factor, 0);
+    const nextX = base.x + w * dx;
+    const nextY = base.y + h * dy;
+    deformed[key].x = clamp(nextX, base.x - w * profile.clampX, base.x + w * profile.clampX);
+    deformed[key].y = clamp(nextY, base.y - h * profile.clampY, base.y + h * profile.clampY);
+  });
+
+  deformed.center.x = (deformed.innerUpperMid.x + deformed.innerLowerMid.x + deformed.leftCorner.x + deformed.rightCorner.x) / 4;
+  deformed.center.y = (deformed.upperMid.y + deformed.lowerMid.y + deformed.innerUpperMid.y + deformed.innerLowerMid.y) / 4;
   return deformed;
 }
 
