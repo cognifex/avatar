@@ -10,6 +10,9 @@ const micBtn = document.getElementById('micBtn');
 const stopMicBtn = document.getElementById('stopMicBtn');
 const sensitivityInput = document.getElementById('sensitivityInput');
 const latencyInput = document.getElementById('latencyInput');
+const profileSelect = document.getElementById('profileSelect');
+const responsivenessInput = document.getElementById('responsivenessInput');
+const expressivenessInput = document.getElementById('expressivenessInput');
 const regionSelect = document.getElementById('regionSelect');
 const drawRegionBtn = document.getElementById('drawRegionBtn');
 const adoptRegionBtn = document.getElementById('adoptRegionBtn');
@@ -87,6 +90,45 @@ const animationTuning = {
   },
 };
 
+const STORAGE_KEYS = {
+  profile: 'avatar.profile',
+  responsiveness: 'avatar.responsiveness',
+  expressiveness: 'avatar.expressiveness',
+};
+
+const ANIMATION_PROFILES = {
+  natural: {
+    visemeSensitivity: 1,
+    visemeSmoothingAttackMul: 1,
+    visemeSmoothingReleaseMul: 1,
+    headMotionMul: 1,
+    mouthDeformMul: 1,
+    transientBoostMul: 1,
+  },
+  energetic: {
+    visemeSensitivity: 1.2,
+    visemeSmoothingAttackMul: 1.22,
+    visemeSmoothingReleaseMul: 1.05,
+    headMotionMul: 1.25,
+    mouthDeformMul: 1.15,
+    transientBoostMul: 1.3,
+  },
+  cartoon: {
+    visemeSensitivity: 1.35,
+    visemeSmoothingAttackMul: 1.35,
+    visemeSmoothingReleaseMul: 0.9,
+    headMotionMul: 1.55,
+    mouthDeformMul: 1.4,
+    transientBoostMul: 1.45,
+  },
+};
+
+const runtimeProfileState = {
+  profile: 'natural',
+  responsiveness: 0.5,
+  expressiveness: 0.5,
+};
+
 const avatarState = {
   faceBox: null,
   autoFaceRegions: null,
@@ -112,6 +154,8 @@ const regionEditState = {
 };
 
 setupDrawing();
+hydrateProfileSettings();
+bindProfileControls();
 renderId = requestAnimationFrame(renderOutput);
 
 clearBtn.addEventListener('click', () => {
@@ -679,7 +723,8 @@ function extractFrameFeatures(timeData, freqData, sampleRate) {
 }
 
 function deriveVisemeWeights(features, pitchHz, sensitivity) {
-  const sens = clamp(sensitivity, 0.6, 2.2);
+  const profile = getResolvedProfileParams();
+  const sens = clamp(sensitivity * profile.visemeSensitivity, 0.6, 2.6);
   const voicedEnergy = clamp(features.energy * sens, 0, 1);
   const low = features.lowBand;
   const mid = features.midBand;
@@ -719,6 +764,7 @@ function normalizeVisemeWeights(weights) {
 
 function smoothVisemeWeights(current, target, latency, state) {
   const tuning = animationTuning;
+  const profile = getResolvedProfileParams();
   const now = performance.now();
   const features = state.featureState || {};
   const signalWeights = tuning.transientBoost.signalWeights;
@@ -734,7 +780,7 @@ function smoothVisemeWeights(current, target, latency, state) {
   }
   const boostedTarget = { ...target };
   if ((state.transientBoostFrames || 0) > 0) {
-    boostedTarget.fv = clamp(boostedTarget.fv + tuning.transientBoost.fvBoost, 0, 1);
+    boostedTarget.fv = clamp(boostedTarget.fv + tuning.transientBoost.fvBoost * profile.transientBoostMul, 0, 1);
     state.transientBoostFrames -= 1;
   }
 
@@ -755,8 +801,8 @@ function smoothVisemeWeights(current, target, latency, state) {
     let desired = boostedTarget[key] ?? 0;
     if (holdActive && key === 'closed') desired = Math.min(desired, prev);
     const visemeTuning = tuning.visemeSmoothing.perViseme[key] || {};
-    const attack = (tuning.visemeSmoothing.attackBase - latency * tuning.visemeSmoothing.latencyAttackFactor) * (visemeTuning.attackMul || 1);
-    const release = (tuning.visemeSmoothing.releaseBase - latency * tuning.visemeSmoothing.latencyReleaseFactor) * (visemeTuning.releaseMul || 1);
+    const attack = (tuning.visemeSmoothing.attackBase - latency * tuning.visemeSmoothing.latencyAttackFactor) * (visemeTuning.attackMul || 1) * profile.visemeSmoothingAttackMul;
+    const release = (tuning.visemeSmoothing.releaseBase - latency * tuning.visemeSmoothing.latencyReleaseFactor) * (visemeTuning.releaseMul || 1) * profile.visemeSmoothingReleaseMul;
     const alpha = desired > prev ? attack : release;
     next[key] = smooth(prev, desired, clamp(alpha, tuning.visemeSmoothing.alphaClamp.min, tuning.visemeSmoothing.alphaClamp.max));
   });
@@ -901,6 +947,7 @@ function buildMouthAnchors(bounds) {
 }
 
 function deformMouthAnchors(anchors, bounds, visemeWeights) {
+  const profile = getResolvedProfileParams();
   const deformed = Object.fromEntries(
     Object.entries(anchors).map(([key, point]) => [key, { x: point.x, y: point.y }]),
   );
@@ -934,8 +981,8 @@ function deformMouthAnchors(anchors, bounds, visemeWeights) {
   Object.entries(visemeProfiles).forEach(([key, profile]) => {
     if (!deformed[key]) return;
     const base = anchors[key];
-    const dx = Object.entries(profile.dx).reduce((sum, [viseme, factor]) => sum + weights[viseme] * factor, 0);
-    const dy = Object.entries(profile.dy).reduce((sum, [viseme, factor]) => sum + weights[viseme] * factor, 0);
+    const dx = Object.entries(profile.dx).reduce((sum, [viseme, factor]) => sum + weights[viseme] * factor, 0) * profileStateMouthMul();
+    const dy = Object.entries(profile.dy).reduce((sum, [viseme, factor]) => sum + weights[viseme] * factor, 0) * profileStateMouthMul();
     const nextX = base.x + w * dx;
     const nextY = base.y + h * dy;
     deformed[key].x = clamp(nextX, base.x - w * profile.clampX, base.x + w * profile.clampX);
@@ -979,13 +1026,14 @@ function affineFromTriangles(srcTri, dstTri) {
 }
 
 function animateHeadBounce(faceBox, level, features = {}, pitchHz = 0) {
+  const profile = getResolvedProfileParams();
   const { x, y, w, h } = faceBox;
   const energy = features.energy || level || 0;
   const lowBand = features.lowBand || 0;
   const centroidNorm = features.centroidNorm || 0;
   const pitchBoost = clamp((pitchHz - 180) / 420, 0, 1);
   const brightBoost = clamp((centroidNorm - 0.35) * 0.5 + pitchBoost * 0.25, 0, 0.42);
-  const dynamics = 1 + brightBoost;
+  const dynamics = (1 + brightBoost) * profile.headMotionMul;
 
   motionState.drift = smooth(motionState.drift, (lowBand - 0.5) * h * 0.03 * dynamics, 0.08);
   const noiseTarget = (Math.random() * 2 - 1) * h * 0.012 * (0.35 + energy * 0.65);
@@ -1004,6 +1052,55 @@ function animateHeadBounce(faceBox, level, features = {}, pitchHz = 0) {
 
   outputCtx.clearRect(x - 2, y - 2, w + 4, h + 4);
   outputCtx.drawImage(bufferCanvas, x, y, w, h, x, y + offsetY, w, h);
+}
+
+function bindProfileControls() {
+  profileSelect?.addEventListener('change', () => {
+    runtimeProfileState.profile = profileSelect.value in ANIMATION_PROFILES ? profileSelect.value : 'natural';
+    persistProfileSettings();
+  });
+  responsivenessInput?.addEventListener('input', () => {
+    runtimeProfileState.responsiveness = clamp(Number(responsivenessInput.value || 0.5), 0, 1);
+    persistProfileSettings();
+  });
+  expressivenessInput?.addEventListener('input', () => {
+    runtimeProfileState.expressiveness = clamp(Number(expressivenessInput.value || 0.5), 0, 1);
+    persistProfileSettings();
+  });
+}
+
+function hydrateProfileSettings() {
+  const storedProfile = localStorage.getItem(STORAGE_KEYS.profile);
+  runtimeProfileState.profile = storedProfile in ANIMATION_PROFILES ? storedProfile : 'natural';
+  runtimeProfileState.responsiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.responsiveness) || 0.5), 0, 1);
+  runtimeProfileState.expressiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.expressiveness) || 0.5), 0, 1);
+  if (profileSelect) profileSelect.value = runtimeProfileState.profile;
+  if (responsivenessInput) responsivenessInput.value = String(runtimeProfileState.responsiveness);
+  if (expressivenessInput) expressivenessInput.value = String(runtimeProfileState.expressiveness);
+}
+
+function persistProfileSettings() {
+  localStorage.setItem(STORAGE_KEYS.profile, runtimeProfileState.profile);
+  localStorage.setItem(STORAGE_KEYS.responsiveness, String(runtimeProfileState.responsiveness));
+  localStorage.setItem(STORAGE_KEYS.expressiveness, String(runtimeProfileState.expressiveness));
+}
+
+function getResolvedProfileParams() {
+  const base = ANIMATION_PROFILES[runtimeProfileState.profile] || ANIMATION_PROFILES.natural;
+  const responsivenessBoost = 0.75 + runtimeProfileState.responsiveness * 0.6;
+  const expressivenessBoost = 0.75 + runtimeProfileState.expressiveness * 0.7;
+  return {
+    visemeSensitivity: base.visemeSensitivity * expressivenessBoost,
+    visemeSmoothingAttackMul: base.visemeSmoothingAttackMul * responsivenessBoost,
+    visemeSmoothingReleaseMul: base.visemeSmoothingReleaseMul * (0.85 + runtimeProfileState.responsiveness * 0.4),
+    headMotionMul: base.headMotionMul * expressivenessBoost,
+    mouthDeformMul: base.mouthDeformMul * expressivenessBoost,
+    transientBoostMul: base.transientBoostMul * (0.85 + runtimeProfileState.responsiveness * 0.5),
+  };
+}
+
+function profileStateMouthMul() {
+  return getResolvedProfileParams().mouthDeformMul;
 }
 
 function animateExpressionRegions(faceBox, features = {}, pitchHz = 0) {
