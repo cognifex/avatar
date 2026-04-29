@@ -53,6 +53,37 @@ const audioState = {
     zeroCrossNorm: 0,
   },
   visemeHoldUntil: 0,
+  transientBoostFrames: 0,
+  prevTransientSignal: 0,
+};
+
+const animationTuning = {
+  visemeSmoothing: {
+    attackBase: 0.36,
+    releaseBase: 0.14,
+    latencyAttackFactor: 0.24,
+    latencyReleaseFactor: 0.09,
+    alphaClamp: { min: 0.03, max: 0.9 },
+    perViseme: {
+      open: { attackMul: 1.35, releaseMul: 0.58 },
+      wide: { attackMul: 1.32, releaseMul: 1.0 },
+      fv: { attackMul: 1.45, releaseMul: 0.75 },
+    },
+  },
+  hold: {
+    baseMs: 16,
+    latencyMsFactor: 52,
+    energyMsFactor: 36,
+    minMs: 8,
+    maxMs: 88,
+    strongOpenThresholds: { open: 0.2, wide: 0.14, round: 0.14, fv: 0.18 },
+  },
+  transientBoost: {
+    signalWeights: { highBand: 0.62, zeroCrossNorm: 0.38 },
+    riseThreshold: 0.2,
+    frames: 2,
+    fvBoost: 0.22,
+  },
 };
 
 const avatarState = {
@@ -674,22 +705,47 @@ function normalizeVisemeWeights(weights) {
 }
 
 function smoothVisemeWeights(current, target, latency, state) {
+  const tuning = animationTuning;
   const now = performance.now();
-  const attack = 0.42 - latency * 0.3;
-  const release = 0.16 - latency * 0.1;
-  const holdMs = 42 + latency * 120;
+  const features = state.featureState || {};
+  const signalWeights = tuning.transientBoost.signalWeights;
+  const transientSignal = clamp(
+    (features.highBand || 0) * signalWeights.highBand + (features.zeroCrossNorm || 0) * signalWeights.zeroCrossNorm,
+    0,
+    1,
+  );
+  const transientRise = transientSignal - (state.prevTransientSignal || 0);
+  state.prevTransientSignal = transientSignal;
+  if (transientRise > tuning.transientBoost.riseThreshold) {
+    state.transientBoostFrames = tuning.transientBoost.frames;
+  }
+  const boostedTarget = { ...target };
+  if ((state.transientBoostFrames || 0) > 0) {
+    boostedTarget.fv = clamp(boostedTarget.fv + tuning.transientBoost.fvBoost, 0, 1);
+    state.transientBoostFrames -= 1;
+  }
 
-  const hasStrongOpen = target.open > 0.22 || target.wide > 0.16 || target.round > 0.16 || target.fv > 0.2;
+  const holdMs = clamp(
+    tuning.hold.baseMs + latency * tuning.hold.latencyMsFactor + (features.energy || 0) * tuning.hold.energyMsFactor,
+    tuning.hold.minMs,
+    tuning.hold.maxMs,
+  );
+
+  const th = tuning.hold.strongOpenThresholds;
+  const hasStrongOpen = boostedTarget.open > th.open || boostedTarget.wide > th.wide || boostedTarget.round > th.round || boostedTarget.fv > th.fv;
   if (hasStrongOpen) state.visemeHoldUntil = now + holdMs;
   const holdActive = now < state.visemeHoldUntil;
 
   const next = {};
   ['closed', 'open', 'wide', 'round', 'fv'].forEach((key) => {
     const prev = current[key] ?? (key === 'closed' ? 1 : 0);
-    let desired = target[key] ?? 0;
+    let desired = boostedTarget[key] ?? 0;
     if (holdActive && key === 'closed') desired = Math.min(desired, prev);
+    const visemeTuning = tuning.visemeSmoothing.perViseme[key] || {};
+    const attack = (tuning.visemeSmoothing.attackBase - latency * tuning.visemeSmoothing.latencyAttackFactor) * (visemeTuning.attackMul || 1);
+    const release = (tuning.visemeSmoothing.releaseBase - latency * tuning.visemeSmoothing.latencyReleaseFactor) * (visemeTuning.releaseMul || 1);
     const alpha = desired > prev ? attack : release;
-    next[key] = smooth(prev, desired, clamp(alpha, 0.03, 0.9));
+    next[key] = smooth(prev, desired, clamp(alpha, tuning.visemeSmoothing.alphaClamp.min, tuning.visemeSmoothing.alphaClamp.max));
   });
   return normalizeVisemeWeights(next);
 }
