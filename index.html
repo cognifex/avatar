@@ -55,6 +55,20 @@
           </label>
         </div>
         <div class="toolbar">
+          <button id="trackingToggleBtn" type="button">Face Tracking: On</button>
+          <label>
+            Modus
+            <select id="modeSelect">
+              <option value="tracking_audio">Tracking + Audio</option>
+              <option value="audio_only">Audio only</option>
+            </select>
+          </label>
+          <label class="toggle">
+            <input id="debugOverlayToggle" type="checkbox" />
+            Debug-Overlay
+          </label>
+        </div>
+        <div class="toolbar">
           <label>
             Tracking Smoothness
             <input id="trackingSmoothnessInput" type="range" min="0" max="1" step="0.01" value="0.55" />
