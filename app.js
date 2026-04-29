@@ -158,6 +158,13 @@ const avatarState = {
   baseFrame: null,
 };
 
+const landmarkExpressionState = {
+  valid: false,
+  mouth: { open: 0, wide: 0, round: 0, corners: 0 },
+  eyes: { openness: 0, squeeze: 0 },
+  brows: { lift: 0, frown: 0 },
+};
+
 const motionState = {
   enabled: true,
   drift: 0,
@@ -870,7 +877,7 @@ async function startMic() {
 
     const targetVisemes = deriveVisemeWeights(audioState.featureState, audioState.pitchHz, sensitivity);
     const expressionState = deriveExpressionState(audioState.featureState, audioState.expressionTiming, runtimeProfileState.profile);
-    const faceState = blendFaceState(targetVisemes, expressionState);
+    const faceState = blendFaceState(targetVisemes, expressionState, landmarkExpressionState, trackingState);
     audioState.expressionState = expressionState;
     audioState.visemeWeights = smoothVisemeWeights(audioState.visemeWeights, faceState.visemeWeights, latency, audioState);
 
@@ -1088,30 +1095,51 @@ function deriveExpressionState(audioFeatures, timingState, mode = 'natural') {
   };
 }
 
-function blendFaceState(visemeState, expressionState) {
+function blendFaceState(visemeState, expressionState, landmarkState, tracking) {
   const v = visemeState || { closed: 1, open: 0, wide: 0, round: 0, fv: 0 };
   const e = expressionState || { intensity: 0, eyeLift: 0, browLift: 0, headTilt: 0, mouthCorner: 0 };
+  const l = landmarkState || { valid: false, mouth: {}, eyes: {}, brows: {} };
+  const trackingValid = !!(tracking?.enabled && !tracking?.fallbackMode && (tracking?.confidence || 0) >= trackingConfig.minConfidence);
+  const mouthLandmarkMin = trackingValid ? 0.28 : 0;
+  const audioKick = trackingValid ? 0.72 : 1;
 
-  const expressionMouthMix = clamp((e.intensity || 0) * 0.18, 0, 0.22);
   const mouth = normalizeVisemeWeights({
-    closed: clamp((v.closed || 0) + expressionMouthMix * 0.05, 0, 1),
-    open: clamp((v.open || 0) + expressionMouthMix * 0.08, 0, 1),
-    wide: clamp((v.wide || 0) + (e.mouthCorner || 0) * expressionMouthMix * 0.24, 0, 1),
-    round: clamp((v.round || 0) * (1 - expressionMouthMix * 0.2), 0, 1),
-    fv: clamp((v.fv || 0) * (1 - expressionMouthMix * 0.12), 0, 1),
+    closed: clamp((v.closed || 0) * audioKick + mouthLandmarkMin * (1 - (l.mouth?.open || 0)), 0, 1),
+    open: clamp((v.open || 0) * audioKick + mouthLandmarkMin * (l.mouth?.open || 0), 0, 1),
+    wide: clamp((v.wide || 0) * audioKick + mouthLandmarkMin * (l.mouth?.wide || 0), 0, 1),
+    round: clamp((v.round || 0) * audioKick + mouthLandmarkMin * (l.mouth?.round || 0), 0, 1),
+    fv: clamp((v.fv || 0) * audioKick, 0, 1),
   });
 
   return {
     visemeWeights: mouth,
     expression: {
-      eyeLift: e.eyeLift || 0,
-      browLift: e.browLift || 0,
+      eyeLift: clamp((e.eyeLift || 0) * 0.6 + (l.eyes?.openness || 0) * 0.4, 0, 1),
+      browLift: clamp((e.browLift || 0) * 0.6 + (l.brows?.lift || 0) * 0.4, 0, 1),
       headTilt: e.headTilt || 0,
-      mouthCorner: e.mouthCorner || 0,
+      mouthCorner: clamp((e.mouthCorner || 0) * 0.6 + Math.max(0, l.mouth?.corners || 0) * 0.4, 0, 1),
       intensity: e.intensity || 0,
     },
   };
 }
+
+function deriveLandmarkExpressionState() {
+  const empty = { valid: false, mouth: { open: 0, wide: 0, round: 0, corners: 0 }, eyes: { openness: 0, squeeze: 0 }, brows: { lift: 0, frown: 0 } };
+  const mouth = getPreferredRegion('mouth');
+  const leftEye = getPreferredRegion('leftEye');
+  const rightEye = getPreferredRegion('rightEye');
+  const brows = getPreferredRegion('brows');
+  if (!mouth || !leftEye || !rightEye || !brows) return empty;
+  const mb = getRegionBounds(mouth); const lb = getRegionBounds(leftEye); const rb = getRegionBounds(rightEye); const bb = getRegionBounds(brows);
+  if (!mb || !lb || !rb || !bb) return empty;
+  const mouthOpen = clamp((mb.h / Math.max(mb.w, 1) - 0.16) * 2.6, 0, 1);
+  const mouthWide = clamp((mb.w / Math.max(mb.h, 1) - 1.8) * 0.45, 0, 1);
+  const mouthRound = clamp((1.15 - mb.w / Math.max(mb.h, 1)) * 0.7, 0, 1);
+  const eyeOpen = clamp((((lb.h / Math.max(lb.w,1)) + (rb.h / Math.max(rb.w,1))) * 0.5 - 0.22) * 3, 0, 1);
+  const browLift = clamp(((lb.y + rb.y) * 0.5 - bb.y) / Math.max(mb.h * 1.6, 1), 0, 1);
+  return { valid: true, mouth: { open: mouthOpen, wide: mouthWide, round: mouthRound, corners: mouthWide - mouthRound }, eyes: { openness: eyeOpen, squeeze: 1-eyeOpen }, brows: { lift: browLift, frown: clamp(1-browLift,0,1) } };
+}
+
 function normalizeVisemeWeights(weights) {
   const clean = {
     closed: clamp(weights.closed || 0, 0, 1),
@@ -1182,11 +1210,14 @@ function renderOutput() {
   outputCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
 
   if (avatarState.baseFrame) {
+    const nextLandmarkState = deriveLandmarkExpressionState();
+    Object.assign(landmarkExpressionState, nextLandmarkState);
     outputCtx.putImageData(avatarState.baseFrame, 0, 0);
 
     if (avatarState.faceBox) {
       const mouthRegion = resolveMouthRegion(avatarState.faceBox);
-      animateMouthFromRegion(mouthRegion, audioState.visemeWeights);
+      animateMouthFromRegion(mouthRegion, audioState.visemeWeights, landmarkExpressionState);
+      animateEyeAndBrowRegions(avatarState.faceBox, landmarkExpressionState);
     }
 
     if (avatarState.faceBox && audioState.level > 0.04) {
@@ -1200,12 +1231,12 @@ function renderOutput() {
   renderId = requestAnimationFrame(renderOutput);
 }
 
-function animateMouthFromRegion(mouthRegion, visemeWeights) {
+function animateMouthFromRegion(mouthRegion, visemeWeights, landmarkState) {
   if (!mouthRegion) return;
   const bounds = getRegionBounds(mouthRegion);
   if (!bounds) return;
   const srcAnchors = buildMouthAnchors(bounds);
-  const dstAnchors = deformMouthAnchors(srcAnchors, bounds, visemeWeights);
+  const dstAnchors = deformMouthAnchors(srcAnchors, bounds, visemeWeights, landmarkState);
 
   bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
   bufferCtx.drawImage(outputCanvas, 0, 0);
@@ -1249,6 +1280,22 @@ function animateMouthFromRegion(mouthRegion, visemeWeights) {
   });
 
   outputCtx.restore();
+}
+
+function animateEyeAndBrowRegions(faceBox, landmarkState) {
+  if (!faceBox || !landmarkState?.valid) return;
+  const deformRegion = (region, dx, dy) => {
+    if (!region) return;
+    const b = getRegionBounds(region); if (!b) return;
+    outputCtx.save(); traceRegionPath(outputCtx, region); outputCtx.clip();
+    outputCtx.drawImage(outputCanvas, b.x, b.y, b.w, b.h, b.x + dx, b.y + dy, b.w, b.h);
+    outputCtx.restore();
+  };
+  const eyeOffset = (0.5 - (landmarkState.eyes?.openness || 0.5)) * faceBox.h * 0.015;
+  const browOffset = -((landmarkState.brows?.lift || 0) * faceBox.h * 0.02);
+  deformRegion(getPreferredRegion('leftEye'), 0, eyeOffset);
+  deformRegion(getPreferredRegion('rightEye'), 0, eyeOffset);
+  deformRegion(getPreferredRegion('brows'), 0, browOffset);
 }
 
 function resolveMouthRegion(faceBox) {
@@ -1315,7 +1362,7 @@ function buildMouthAnchors(bounds) {
   };
 }
 
-function deformMouthAnchors(anchors, bounds, visemeWeights) {
+function deformMouthAnchors(anchors, bounds, visemeWeights, landmarkState) {
   const profile = getResolvedProfileParams();
   const deformed = Object.fromEntries(
     Object.entries(anchors).map(([key, point]) => [key, { x: point.x, y: point.y }]),
@@ -1346,7 +1393,8 @@ function deformMouthAnchors(anchors, bounds, visemeWeights) {
     innerLowerMid: { dx: { closed: 0, open: 0, wide: 0, round: 0, fv: 0 }, dy: { closed: -0.062, open: 0.166, wide: 0.034, round: -0.078, fv: -0.112 }, clampX: 0.05, clampY: 0.18 },
   };
 
-  const weights = { closed, open, wide, round, fv };
+  const lm = landmarkState?.valid ? landmarkState.mouth : { open: 0, wide: 0, round: 0, corners: 0 };
+  const weights = { closed, open: clamp(open + lm.open * 0.45,0,1), wide: clamp(wide + lm.wide * 0.4,0,1), round: clamp(round + lm.round * 0.32,0,1), fv };
   Object.entries(visemeProfiles).forEach(([key, profile]) => {
     if (!deformed[key]) return;
     const base = anchors[key];
