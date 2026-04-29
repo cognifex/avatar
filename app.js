@@ -13,6 +13,8 @@ const latencyInput = document.getElementById('latencyInput');
 const profileSelect = document.getElementById('profileSelect');
 const responsivenessInput = document.getElementById('responsivenessInput');
 const expressivenessInput = document.getElementById('expressivenessInput');
+const trackingSmoothnessInput = document.getElementById('trackingSmoothnessInput');
+const trackingResponsivenessInput = document.getElementById('trackingResponsivenessInput');
 const regionSelect = document.getElementById('regionSelect');
 const drawRegionBtn = document.getElementById('drawRegionBtn');
 const adoptRegionBtn = document.getElementById('adoptRegionBtn');
@@ -112,6 +114,8 @@ const STORAGE_KEYS = {
   profile: 'avatar.profile',
   responsiveness: 'avatar.responsiveness',
   expressiveness: 'avatar.expressiveness',
+  trackingSmoothness: 'avatar.trackingSmoothness',
+  trackingResponsiveness: 'avatar.trackingResponsiveness',
 };
 
 const ANIMATION_PROFILES = {
@@ -169,12 +173,22 @@ const trackingState = {
   lastSeenTs: 0,
   pose: { yaw: 0, pitch: 0, roll: 0 },
   fallbackMode: true,
+  filtered: new Map(),
+  diagnostics: {
+    jitterScore: 0,
+    dropFrames: 0,
+    outlierRejects: 0,
+  },
 };
 
 const trackingConfig = {
   fps: 24,
   minConfidence: 0.5,
   lostFaceMs: 700,
+  maxMovementNorm: 0.085,
+  clampMovementNorm: 0.045,
+  trackingSmoothness: 0.55,
+  trackingResponsiveness: 0.5,
 };
 
 const regionEditState = {
@@ -555,6 +569,84 @@ function collectTrackingLandmarks(faceBox, regions, width, height) {
   return landmarks;
 }
 
+function flattenLandmarkValues(entry) {
+  if (!entry) return [];
+  if (entry.type === 'rect' && entry.rect) return [entry.rect.x, entry.rect.y, entry.rect.w, entry.rect.h];
+  if (entry.type === 'polygon' && Array.isArray(entry.points)) return entry.points.flatMap((point) => [point.x, point.y]);
+  return [];
+}
+
+function confidenceWeightedBlend(raw, filtered, confidence = 1) {
+  const baseBlend = 0.2 + trackingConfig.trackingSmoothness * 0.75;
+  const lowConfidenceBoost = (1 - clamp(confidence, 0, 1)) * 0.5;
+  const blend = clamp(baseBlend + lowConfidenceBoost, 0.1, 0.95);
+  return smooth(raw, filtered, blend);
+}
+
+function adaptiveSmooth(raw, prev, velocity, dt, confidence) {
+  if (!Number.isFinite(prev)) return raw;
+  const speed = Math.abs(velocity) / Math.max(1e-6, dt);
+  const responsiveness = 0.08 + trackingConfig.trackingResponsiveness * 0.65;
+  const dynamic = 1 - Math.exp(-speed * (0.4 + responsiveness));
+  const alpha = clamp(0.06 + dynamic * (0.35 + responsiveness * 0.4), 0.04, 0.95);
+  const ema = smooth(prev, raw, alpha);
+  return confidenceWeightedBlend(raw, ema, confidence);
+}
+
+function smoothLandmarkEntry(entry, prevEntry, dt, confidence) {
+  if (!entry) return entry;
+  if (!prevEntry) return entry;
+  if (entry.type === 'rect' && entry.rect && prevEntry.rect) {
+    const nextRect = {};
+    ['x', 'y', 'w', 'h'].forEach((key) => {
+      const raw = entry.rect[key];
+      const prev = prevEntry.rect[key];
+      const velocity = raw - prev;
+      nextRect[key] = adaptiveSmooth(raw, prev, velocity, dt, confidence);
+    });
+    return { ...entry, rect: nextRect };
+  }
+  if (entry.type === 'polygon' && Array.isArray(entry.points) && Array.isArray(prevEntry.points)) {
+    const points = entry.points.map((point, idx) => {
+      const prev = prevEntry.points[idx] || point;
+      const nx = adaptiveSmooth(point.x, prev.x, point.x - prev.x, dt, confidence);
+      const ny = adaptiveSmooth(point.y, prev.y, point.y - prev.y, dt, confidence);
+      return { x: nx, y: ny };
+    });
+    return { ...entry, points };
+  }
+  return entry;
+}
+
+function clampLandmarkMovement(entry, prevEntry) {
+  if (!entry || !prevEntry) return { entry, rejected: false };
+  const current = flattenLandmarkValues(entry);
+  const prev = flattenLandmarkValues(prevEntry);
+  if (current.length !== prev.length || current.length === 0) return { entry, rejected: false };
+  const diffs = current.map((value, idx) => value - prev[idx]);
+  const maxAbs = diffs.reduce((acc, value) => Math.max(acc, Math.abs(value)), 0);
+  if (maxAbs <= trackingConfig.maxMovementNorm) return { entry, rejected: false };
+  const ratio = trackingConfig.clampMovementNorm / Math.max(1e-6, maxAbs);
+  if (entry.type === 'rect' && entry.rect && prevEntry.rect) {
+    const rect = {};
+    ['x', 'y', 'w', 'h'].forEach((key) => {
+      rect[key] = prevEntry.rect[key] + (entry.rect[key] - prevEntry.rect[key]) * ratio;
+    });
+    return { entry: { ...entry, rect }, rejected: true };
+  }
+  if (entry.type === 'polygon' && Array.isArray(entry.points) && Array.isArray(prevEntry.points)) {
+    const points = entry.points.map((point, idx) => {
+      const prevPoint = prevEntry.points[idx] || point;
+      return {
+        x: prevPoint.x + (point.x - prevPoint.x) * ratio,
+        y: prevPoint.y + (point.y - prevPoint.y) * ratio,
+      };
+    });
+    return { entry: { ...entry, points }, rejected: true };
+  }
+  return { entry, rejected: true };
+}
+
 function estimatePoseFromFace(faceBox) {
   if (!faceBox) return { yaw: 0, pitch: 0, roll: 0 };
   const centerX = faceBox.x + faceBox.w / 2;
@@ -572,6 +664,7 @@ function applyTrackingFallback() {
   trackingState.confidence = 0;
   trackingState.landmarks = [];
   trackingState.pose = { yaw: 0, pitch: 0, roll: 0 };
+  trackingState.filtered.clear();
 }
 
 function analyzeTrackingFrame(now = performance.now()) {
@@ -593,9 +686,39 @@ function analyzeTrackingFrame(now = performance.now()) {
 
   trackingState.enabled = true;
   trackingState.fallbackMode = false;
+  const dt = Math.max(1 / trackingConfig.fps, trackingState.lastSeenTs ? (now - trackingState.lastSeenTs) / 1000 : 1 / trackingConfig.fps);
+  if (trackingState.lastSeenTs) {
+    const expectedFrameMs = 1000 / trackingConfig.fps;
+    const dropped = Math.max(0, Math.round((now - trackingState.lastSeenTs) / expectedFrameMs) - 1);
+    trackingState.diagnostics.dropFrames += dropped;
+  }
   trackingState.lastSeenTs = now;
-  trackingState.pose = estimatePoseFromFace(box);
-  trackingState.landmarks = collectTrackingLandmarks(box, regions, drawCanvas.width, drawCanvas.height);
+  const rawPose = estimatePoseFromFace(box);
+  trackingState.pose = {
+    yaw: adaptiveSmooth(rawPose.yaw, trackingState.pose.yaw, rawPose.yaw - trackingState.pose.yaw, dt, confidence),
+    pitch: adaptiveSmooth(rawPose.pitch, trackingState.pose.pitch, rawPose.pitch - trackingState.pose.pitch, dt, confidence),
+    roll: adaptiveSmooth(rawPose.roll, trackingState.pose.roll, rawPose.roll - trackingState.pose.roll, dt, confidence),
+  };
+  const rawLandmarks = collectTrackingLandmarks(box, regions, drawCanvas.width, drawCanvas.height);
+  let frameJitter = 0;
+  let frameOutliers = 0;
+  const nextLandmarks = rawLandmarks.map((entry) => {
+    const prev = trackingState.filtered.get(entry.key);
+    const smoothed = smoothLandmarkEntry(entry, prev, dt, confidence);
+    const { entry: clampedEntry, rejected } = clampLandmarkMovement(smoothed, prev);
+    if (rejected) frameOutliers += 1;
+    const currentFlat = flattenLandmarkValues(clampedEntry);
+    const prevFlat = flattenLandmarkValues(prev);
+    if (currentFlat.length === prevFlat.length && currentFlat.length > 0) {
+      const meanDelta = currentFlat.reduce((acc, value, idx) => acc + Math.abs(value - prevFlat[idx]), 0) / currentFlat.length;
+      frameJitter += meanDelta;
+    }
+    trackingState.filtered.set(entry.key, clampedEntry);
+    return clampedEntry;
+  });
+  trackingState.landmarks = nextLandmarks;
+  trackingState.diagnostics.outlierRejects += frameOutliers;
+  trackingState.diagnostics.jitterScore = smooth(trackingState.diagnostics.jitterScore, frameJitter, 0.2);
   avatarState.faceBox = box;
   avatarState.autoFaceRegions = regions;
 }
@@ -1314,6 +1437,14 @@ function bindProfileControls() {
     runtimeProfileState.expressiveness = clamp(Number(expressivenessInput.value || 0.5), 0, 1);
     persistProfileSettings();
   });
+  trackingSmoothnessInput?.addEventListener('input', () => {
+    trackingConfig.trackingSmoothness = clamp(Number(trackingSmoothnessInput.value || 0.55), 0, 1);
+    persistProfileSettings();
+  });
+  trackingResponsivenessInput?.addEventListener('input', () => {
+    trackingConfig.trackingResponsiveness = clamp(Number(trackingResponsivenessInput.value || 0.5), 0, 1);
+    persistProfileSettings();
+  });
 }
 
 function hydrateProfileSettings() {
@@ -1321,15 +1452,21 @@ function hydrateProfileSettings() {
   runtimeProfileState.profile = storedProfile in ANIMATION_PROFILES ? storedProfile : 'natural';
   runtimeProfileState.responsiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.responsiveness) || 0.5), 0, 1);
   runtimeProfileState.expressiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.expressiveness) || 0.5), 0, 1);
+  trackingConfig.trackingSmoothness = clamp(Number(localStorage.getItem(STORAGE_KEYS.trackingSmoothness) || trackingConfig.trackingSmoothness), 0, 1);
+  trackingConfig.trackingResponsiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.trackingResponsiveness) || trackingConfig.trackingResponsiveness), 0, 1);
   if (profileSelect) profileSelect.value = runtimeProfileState.profile;
   if (responsivenessInput) responsivenessInput.value = String(runtimeProfileState.responsiveness);
   if (expressivenessInput) expressivenessInput.value = String(runtimeProfileState.expressiveness);
+  if (trackingSmoothnessInput) trackingSmoothnessInput.value = String(trackingConfig.trackingSmoothness);
+  if (trackingResponsivenessInput) trackingResponsivenessInput.value = String(trackingConfig.trackingResponsiveness);
 }
 
 function persistProfileSettings() {
   localStorage.setItem(STORAGE_KEYS.profile, runtimeProfileState.profile);
   localStorage.setItem(STORAGE_KEYS.responsiveness, String(runtimeProfileState.responsiveness));
   localStorage.setItem(STORAGE_KEYS.expressiveness, String(runtimeProfileState.expressiveness));
+  localStorage.setItem(STORAGE_KEYS.trackingSmoothness, String(trackingConfig.trackingSmoothness));
+  localStorage.setItem(STORAGE_KEYS.trackingResponsiveness, String(trackingConfig.trackingResponsiveness));
 }
 
 function getResolvedProfileParams() {
