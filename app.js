@@ -1,6 +1,8 @@
 const drawCanvas = document.getElementById('drawCanvas');
 const drawGuideCanvas = document.getElementById('drawGuideCanvas');
 const outputCanvas = document.getElementById('outputCanvas');
+const trackingVideo = document.getElementById('trackingVideo');
+const trackingDebugCanvas = document.getElementById('trackingDebugCanvas');
 
 const brushSizeInput = document.getElementById('brushSize');
 const clearBtn = document.getElementById('clearBtn');
@@ -30,6 +32,7 @@ const outputWrap = document.getElementById('outputWrap');
 const drawCtx = drawCanvas.getContext('2d');
 const guideCtx = drawGuideCanvas.getContext('2d');
 const outputCtx = outputCanvas.getContext('2d');
+const trackingDebugCtx = trackingDebugCanvas?.getContext('2d');
 
 const bufferCanvas = document.createElement('canvas');
 bufferCanvas.width = drawCanvas.width;
@@ -43,6 +46,7 @@ let micStream;
 let audioLoopId;
 let renderId;
 let trackingLoopId;
+let trackingStream;
 
 const audioState = {
   level: 0,
@@ -692,13 +696,15 @@ function applyTrackingFallback(status = 'face_lost') {
 }
 
 function analyzeTrackingFrame(now = performance.now()) {
-  const box = detectFaceBoxFromDrawing();
   if (!trackingState.desiredEnabled || runtimeProfileState.mode === 'audio_only') {
     if (!trackingState.fallbackMode) applyTrackingFallback('disabled');
     return;
   }
-
-  if (!box) {
+  const cameraResult = detectFaceFromTrackingVideo();
+  const box = cameraResult?.faceBox || detectFaceBoxFromDrawing();
+  const regions = cameraResult?.regions || (box ? detectFaceRegionsFromDrawing(box) : null);
+  const source = cameraResult?.faceBox ? 'camera' : 'drawing_fallback';
+  if (!box || !regions) {
     if (trackingState.lastSeenTs && now - trackingState.lastSeenTs > trackingConfig.lostFaceMs) {
       applyTrackingFallback('face_lost');
       avatarState.faceBox = null;
@@ -707,8 +713,6 @@ function analyzeTrackingFrame(now = performance.now()) {
     trackingState.status = trackingState.lastSeenTs ? 'reacquiring' : 'face_lost';
     return;
   }
-
-  const regions = detectFaceRegionsFromDrawing(box);
   const coverage = (box.w * box.h) / (drawCanvas.width * drawCanvas.height);
   const confidence = clamp(coverage * 5, 0, 1);
   trackingState.confidence = confidence;
@@ -755,10 +759,12 @@ function analyzeTrackingFrame(now = performance.now()) {
   trackingState.diagnostics.jitterScore = smooth(trackingState.diagnostics.jitterScore, frameJitter, 0.2);
   avatarState.faceBox = box;
   avatarState.autoFaceRegions = regions;
+  trackingState.source = source;
 }
 
 function startFaceTracking() {
   if (trackingLoopId) return;
+  startCameraTracking();
   const frameInterval = 1000 / trackingConfig.fps;
   let lastTick = 0;
   const loop = (ts) => {
@@ -774,7 +780,107 @@ function startFaceTracking() {
 function stopFaceTracking() {
   if (trackingLoopId) cancelAnimationFrame(trackingLoopId);
   trackingLoopId = undefined;
+  stopCameraTracking();
   applyTrackingFallback();
+}
+
+async function startCameraTracking() {
+  if (!trackingVideo || trackingStream) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+    trackingStream = stream;
+    trackingVideo.srcObject = stream;
+    await trackingVideo.play();
+    trackingState.cameraAccess = 'granted';
+    if (trackingState.status !== 'tracking') trackingState.status = 'camera_ready';
+  } catch (err) {
+    console.error('Camera tracking start failed:', err);
+    trackingState.cameraAccess = 'denied';
+    trackingState.status = 'camera_denied';
+  }
+}
+
+function stopCameraTracking() {
+  if (!trackingStream) return;
+  trackingStream.getTracks().forEach((track) => track.stop());
+  trackingStream = null;
+  if (trackingVideo) trackingVideo.srcObject = null;
+  trackingState.cameraAccess = 'stopped';
+}
+
+function detectFaceFromTrackingVideo() {
+  if (!trackingVideo || !trackingVideo.videoWidth || !trackingVideo.videoHeight) return null;
+  const videoW = trackingVideo.videoWidth;
+  const videoH = trackingVideo.videoHeight;
+  if (!trackingDebugCanvas || !trackingDebugCtx) return null;
+  trackingDebugCanvas.width = videoW;
+  trackingDebugCanvas.height = videoH;
+  trackingDebugCtx.drawImage(trackingVideo, 0, 0, videoW, videoH);
+  const frame = trackingDebugCtx.getImageData(0, 0, videoW, videoH);
+  const faceInVideo = detectFaceBoxFromPixels(frame.data, videoW, videoH, isSkinLikePixel);
+  if (!faceInVideo) return null;
+  const scaleX = drawCanvas.width / videoW;
+  const scaleY = drawCanvas.height / videoH;
+  const faceBox = {
+    x: faceInVideo.x * scaleX,
+    y: faceInVideo.y * scaleY,
+    w: faceInVideo.w * scaleX,
+    h: faceInVideo.h * scaleY,
+  };
+  return {
+    faceBox,
+    regions: detectFaceRegionsByProportions(faceBox),
+  };
+}
+
+function detectFaceRegionsByProportions(faceBox) {
+  if (!faceBox) return null;
+  const mkRect = (rx, ry, rw, rh) => ({ type: 'rect', x: faceBox.x + faceBox.w * rx, y: faceBox.y + faceBox.h * ry, w: faceBox.w * rw, h: faceBox.h * rh, estimated: true });
+  return {
+    mouth: mkRect(0.26, 0.62, 0.48, 0.22),
+    leftEye: mkRect(0.16, 0.32, 0.24, 0.16),
+    rightEye: mkRect(0.60, 0.32, 0.24, 0.16),
+    brows: { type: 'polygon', points: [{ x: faceBox.x + faceBox.w * 0.14, y: faceBox.y + faceBox.h * 0.30 }, { x: faceBox.x + faceBox.w * 0.86, y: faceBox.y + faceBox.h * 0.30 }, { x: faceBox.x + faceBox.w * 0.80, y: faceBox.y + faceBox.h * 0.18 }, { x: faceBox.x + faceBox.w * 0.20, y: faceBox.y + faceBox.h * 0.18 }], estimated: true },
+  };
+}
+
+function detectFaceBoxFromPixels(data, width, height, pixelMatcher) {
+  const visited = new Uint8Array(width * height);
+  const components = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (visited[idx] || !pixelMatcher(data, width, x, y)) continue;
+      const comp = floodComponentPixels(data, width, height, x, y, visited, pixelMatcher);
+      if (comp.area > 200) components.push(comp);
+    }
+  }
+  if (!components.length) return null;
+  const best = components.sort((a, b) => b.area - a.area)[0];
+  return { x: best.minX, y: best.minY, w: best.maxX - best.minX + 1, h: best.maxY - best.minY + 1 };
+}
+
+function floodComponentPixels(data, width, height, sx, sy, visited, pixelMatcher) {
+  const stack = [[sx, sy]];
+  let area = 0; let minX = sx; let minY = sy; let maxX = sx; let maxY = sy;
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    if (x < 0 || y < 0 || x >= width || y >= height) continue;
+    const idx = y * width + x;
+    if (visited[idx]) continue;
+    visited[idx] = 1;
+    if (!pixelMatcher(data, width, x, y)) continue;
+    area++; minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+    stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+  return { area, minX, minY, maxX, maxY };
+}
+
+function isSkinLikePixel(data, width, x, y) {
+  const off = (y * width + x) * 4;
+  const r = data[off], g = data[off + 1], b = data[off + 2], a = data[off + 3];
+  if (a < 16) return false;
+  return r > 60 && g > 40 && b > 20 && r > g && g > b;
 }
 
 function detectBandRect(data, width, faceBox, yRange, xRange) {
@@ -1855,7 +1961,7 @@ function updateTrackingStatusMessage() {
     setStatus('Tracking deaktiviert (Audio only).');
     return;
   }
-  if (trackingState.status === 'tracking') setStatus(`Tracking aktiv (Confidence ${(trackingState.confidence || 0).toFixed(2)}).`);
-  else if (trackingState.status === 'reacquiring') setStatus('Reacquiring face...');
-  else if (trackingState.status === 'face_lost') setStatus('Face lost. Bitte frontal ins Bild.');
+  if (trackingState.status === 'camera_denied') setStatus('Kamera nicht erlaubt. Bitte Kamera-Berechtigung im Browser aktivieren.');
+  else if (trackingState.status === 'tracking') setStatus(`Tracking aktiv (Confidence ${(trackingState.confidence || 0).toFixed(2)}).`);
+  else if (trackingState.status === 'reacquiring' || trackingState.status === 'face_lost') setStatus('Kein Gesicht im Kamerabild. Bitte frontal ins Bild schauen.');
 }
