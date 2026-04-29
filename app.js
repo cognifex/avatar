@@ -19,6 +19,9 @@ const regionSelect = document.getElementById('regionSelect');
 const drawRegionBtn = document.getElementById('drawRegionBtn');
 const adoptRegionBtn = document.getElementById('adoptRegionBtn');
 const resetRegionBtn = document.getElementById('resetRegionBtn');
+const trackingToggleBtn = document.getElementById('trackingToggleBtn');
+const modeSelect = document.getElementById('modeSelect');
+const debugOverlayToggle = document.getElementById('debugOverlayToggle');
 const statusEl = document.getElementById('status');
 const transparentBg = document.getElementById('transparentBg');
 const expressiveMotionToggle = document.getElementById('expressiveMotionToggle');
@@ -116,6 +119,9 @@ const STORAGE_KEYS = {
   expressiveness: 'avatar.expressiveness',
   trackingSmoothness: 'avatar.trackingSmoothness',
   trackingResponsiveness: 'avatar.trackingResponsiveness',
+  trackingEnabled: 'avatar.trackingEnabled',
+  mode: 'avatar.mode',
+  debugOverlay: 'avatar.debugOverlay',
 };
 
 const ANIMATION_PROFILES = {
@@ -149,6 +155,7 @@ const runtimeProfileState = {
   profile: 'natural',
   responsiveness: 0.5,
   expressiveness: 0.5,
+  mode: 'tracking_audio',
 };
 
 const avatarState = {
@@ -175,6 +182,7 @@ const motionState = {
 
 const trackingState = {
   enabled: false,
+  desiredEnabled: true,
   landmarks: [],
   confidence: 0,
   lastSeenTs: 0,
@@ -186,6 +194,7 @@ const trackingState = {
     dropFrames: 0,
     outlierRejects: 0,
   },
+  status: 'idle',
 };
 
 const trackingConfig = {
@@ -210,6 +219,7 @@ const regionEditState = {
 setupDrawing();
 hydrateProfileSettings();
 bindProfileControls();
+bindTrackingControls();
 startFaceTracking();
 renderId = requestAnimationFrame(renderOutput);
 
@@ -227,11 +237,17 @@ clearBtn.addEventListener('click', () => {
 
 detectBtn.addEventListener('click', () => {
   const box = detectFaceBoxFromDrawing();
+  if (!trackingState.desiredEnabled || runtimeProfileState.mode === 'audio_only') {
+    if (!trackingState.fallbackMode) applyTrackingFallback('disabled');
+    return;
+  }
+
   if (!box) {
     avatarState.faceBox = null;
     avatarState.autoFaceRegions = null;
     drawFaceGuide();
     setStatus('Kein Gesicht gefunden. Zeichne den Kopf deutlicher (geschlossene Form hilft).');
+    trackingState.status = trackingState.lastSeenTs ? 'reacquiring' : 'face_lost';
     return;
   }
 
@@ -665,23 +681,30 @@ function estimatePoseFromFace(faceBox) {
   };
 }
 
-function applyTrackingFallback() {
+function applyTrackingFallback(status = 'face_lost') {
   trackingState.enabled = false;
   trackingState.fallbackMode = true;
   trackingState.confidence = 0;
   trackingState.landmarks = [];
   trackingState.pose = { yaw: 0, pitch: 0, roll: 0 };
   trackingState.filtered.clear();
+  trackingState.status = status;
 }
 
 function analyzeTrackingFrame(now = performance.now()) {
   const box = detectFaceBoxFromDrawing();
+  if (!trackingState.desiredEnabled || runtimeProfileState.mode === 'audio_only') {
+    if (!trackingState.fallbackMode) applyTrackingFallback('disabled');
+    return;
+  }
+
   if (!box) {
     if (trackingState.lastSeenTs && now - trackingState.lastSeenTs > trackingConfig.lostFaceMs) {
-      applyTrackingFallback();
+      applyTrackingFallback('face_lost');
       avatarState.faceBox = null;
       avatarState.autoFaceRegions = null;
     }
+    trackingState.status = trackingState.lastSeenTs ? 'reacquiring' : 'face_lost';
     return;
   }
 
@@ -689,9 +712,13 @@ function analyzeTrackingFrame(now = performance.now()) {
   const coverage = (box.w * box.h) / (drawCanvas.width * drawCanvas.height);
   const confidence = clamp(coverage * 5, 0, 1);
   trackingState.confidence = confidence;
-  if (confidence < trackingConfig.minConfidence) return;
+  if (confidence < trackingConfig.minConfidence) {
+    trackingState.status = 'reacquiring';
+    return;
+  }
 
   trackingState.enabled = true;
+  trackingState.status = 'tracking';
   trackingState.fallbackMode = false;
   const dt = Math.max(1 / trackingConfig.fps, trackingState.lastSeenTs ? (now - trackingState.lastSeenTs) / 1000 : 1 / trackingConfig.fps);
   if (trackingState.lastSeenTs) {
@@ -1228,6 +1255,8 @@ function renderOutput() {
     }
   }
 
+  drawDebugOverlay();
+  updateTrackingStatusMessage();
   renderId = requestAnimationFrame(renderOutput);
 }
 
@@ -1502,11 +1531,18 @@ function hydrateProfileSettings() {
   runtimeProfileState.expressiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.expressiveness) || 0.5), 0, 1);
   trackingConfig.trackingSmoothness = clamp(Number(localStorage.getItem(STORAGE_KEYS.trackingSmoothness) || trackingConfig.trackingSmoothness), 0, 1);
   trackingConfig.trackingResponsiveness = clamp(Number(localStorage.getItem(STORAGE_KEYS.trackingResponsiveness) || trackingConfig.trackingResponsiveness), 0, 1);
+  trackingState.desiredEnabled = localStorage.getItem(STORAGE_KEYS.trackingEnabled) !== 'false';
+  runtimeProfileState.mode = localStorage.getItem(STORAGE_KEYS.mode) || 'tracking_audio';
+  const debugOverlayEnabled = localStorage.getItem(STORAGE_KEYS.debugOverlay) === 'true';
   if (profileSelect) profileSelect.value = runtimeProfileState.profile;
   if (responsivenessInput) responsivenessInput.value = String(runtimeProfileState.responsiveness);
   if (expressivenessInput) expressivenessInput.value = String(runtimeProfileState.expressiveness);
   if (trackingSmoothnessInput) trackingSmoothnessInput.value = String(trackingConfig.trackingSmoothness);
   if (trackingResponsivenessInput) trackingResponsivenessInput.value = String(trackingConfig.trackingResponsiveness);
+  if (modeSelect) modeSelect.value = runtimeProfileState.mode;
+  if (debugOverlayToggle) debugOverlayToggle.checked = debugOverlayEnabled;
+  trackingState.debugOverlay = debugOverlayEnabled;
+  if (trackingToggleBtn) trackingToggleBtn.textContent = `Face Tracking: ${trackingState.desiredEnabled ? 'On' : 'Off'}`;
 }
 
 function persistProfileSettings() {
@@ -1515,6 +1551,9 @@ function persistProfileSettings() {
   localStorage.setItem(STORAGE_KEYS.expressiveness, String(runtimeProfileState.expressiveness));
   localStorage.setItem(STORAGE_KEYS.trackingSmoothness, String(trackingConfig.trackingSmoothness));
   localStorage.setItem(STORAGE_KEYS.trackingResponsiveness, String(trackingConfig.trackingResponsiveness));
+  localStorage.setItem(STORAGE_KEYS.trackingEnabled, String(trackingState.desiredEnabled));
+  localStorage.setItem(STORAGE_KEYS.mode, runtimeProfileState.mode);
+  localStorage.setItem(STORAGE_KEYS.debugOverlay, String(!!trackingState.debugOverlay));
 }
 
 function getResolvedProfileParams() {
@@ -1756,4 +1795,67 @@ function getRegionLabel(key) {
       brows: 'Brauen',
     }[key] || key
   );
+}
+
+function bindTrackingControls() {
+  trackingToggleBtn?.addEventListener('click', () => {
+    trackingState.desiredEnabled = !trackingState.desiredEnabled;
+    trackingToggleBtn.textContent = `Face Tracking: ${trackingState.desiredEnabled ? 'On' : 'Off'}`;
+    if (!trackingState.desiredEnabled) applyTrackingFallback('disabled');
+    persistProfileSettings();
+  });
+  modeSelect?.addEventListener('change', () => {
+    runtimeProfileState.mode = modeSelect.value === 'audio_only' ? 'audio_only' : 'tracking_audio';
+    if (runtimeProfileState.mode === 'audio_only') applyTrackingFallback('disabled');
+    persistProfileSettings();
+  });
+  debugOverlayToggle?.addEventListener('change', () => {
+    trackingState.debugOverlay = debugOverlayToggle.checked;
+    persistProfileSettings();
+  });
+}
+
+function drawDebugOverlay() {
+  if (!trackingState.debugOverlay) return;
+  outputCtx.save();
+  outputCtx.fillStyle = 'rgba(2, 6, 23, 0.72)';
+  outputCtx.fillRect(12, 12, 320, 130);
+  outputCtx.fillStyle = '#e2e8f0';
+  outputCtx.font = '13px monospace';
+  const vw = audioState.visemeWeights || {};
+  const lines = [
+    `Confidence: ${(trackingState.confidence || 0).toFixed(2)}`,
+    `Status: ${trackingState.status || 'idle'}`,
+    `Blend: c:${(vw.closed||0).toFixed(2)} o:${(vw.open||0).toFixed(2)} w:${(vw.wide||0).toFixed(2)} r:${(vw.round||0).toFixed(2)} fv:${(vw.fv||0).toFixed(2)}`
+  ];
+  lines.forEach((line, i) => outputCtx.fillText(line, 20, 34 + i * 20));
+  outputCtx.fillStyle = '#22d3ee';
+  trackingState.landmarks?.forEach((lm) => {
+    if (lm.type === 'rect' && lm.rect) {
+      const x = lm.rect.x * outputCanvas.width;
+      const y = lm.rect.y * outputCanvas.height;
+      const w = lm.rect.w * outputCanvas.width;
+      const h = lm.rect.h * outputCanvas.height;
+      outputCtx.strokeRect(x, y, w, h);
+    }
+    if (lm.type === 'polygon' && lm.points?.length) {
+      lm.points.forEach((pt) => {
+        outputCtx.beginPath();
+        outputCtx.arc(pt.x * outputCanvas.width, pt.y * outputCanvas.height, 2.5, 0, Math.PI * 2);
+        outputCtx.fill();
+      });
+    }
+  });
+  outputCtx.restore();
+}
+
+function updateTrackingStatusMessage() {
+  if (regionEditState.active) return;
+  if (!trackingState.desiredEnabled || runtimeProfileState.mode === 'audio_only') {
+    setStatus('Tracking deaktiviert (Audio only).');
+    return;
+  }
+  if (trackingState.status === 'tracking') setStatus(`Tracking aktiv (Confidence ${(trackingState.confidence || 0).toFixed(2)}).`);
+  else if (trackingState.status === 'reacquiring') setStatus('Reacquiring face...');
+  else if (trackingState.status === 'face_lost') setStatus('Face lost. Bitte frontal ins Bild.');
 }
