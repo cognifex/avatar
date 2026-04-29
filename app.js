@@ -59,6 +59,18 @@ const audioState = {
   visemeHoldUntil: 0,
   transientBoostFrames: 0,
   prevTransientSignal: 0,
+  expressionState: {
+    intensity: 0,
+    eyeLift: 0,
+    browLift: 0,
+    headTilt: 0,
+    mouthCorner: 0,
+  },
+  expressionTiming: {
+    peak: 0,
+    holdUntil: 0,
+    cooldownUntil: 0,
+  },
 };
 
 const animationTuning = {
@@ -616,7 +628,10 @@ async function startMic() {
     };
 
     const targetVisemes = deriveVisemeWeights(audioState.featureState, audioState.pitchHz, sensitivity);
-    audioState.visemeWeights = smoothVisemeWeights(audioState.visemeWeights, targetVisemes, latency, audioState);
+    const expressionState = deriveExpressionState(audioState.featureState, audioState.expressionTiming, runtimeProfileState.profile);
+    const faceState = blendFaceState(targetVisemes, expressionState);
+    audioState.expressionState = expressionState;
+    audioState.visemeWeights = smoothVisemeWeights(audioState.visemeWeights, faceState.visemeWeights, latency, audioState);
 
     audioLoopId = requestAnimationFrame(loop);
   };
@@ -644,6 +659,8 @@ function stopMic() {
   audioState.visemeWeights = { closed: 1, open: 0, wide: 0, round: 0, fv: 0 };
   audioState.featureState = { energy: 0, lowBand: 0, midBand: 0, highBand: 0, centroidNorm: 0, zeroCrossNorm: 0 };
   audioState.visemeHoldUntil = 0;
+  audioState.expressionState = { intensity: 0, eyeLift: 0, browLift: 0, headTilt: 0, mouthCorner: 0 };
+  audioState.expressionTiming = { peak: 0, holdUntil: 0, cooldownUntil: 0 };
 }
 
 function estimatePitch(samples, sampleRate) {
@@ -743,6 +760,64 @@ function deriveVisemeWeights(features, pitchHz, sensitivity) {
   return normalizeVisemeWeights({ closed, open, wide, round, fv });
 }
 
+
+
+function deriveExpressionState(audioFeatures, timingState, mode = 'natural') {
+  const features = audioFeatures || {};
+  const energy = features.energy || 0;
+  const bright = clamp((features.highBand || 0) * 0.62 + (features.centroidNorm || 0) * 0.38, 0, 1);
+  const stableLow = clamp((features.lowBand || 0) * 0.7 + energy * 0.3, 0, 1);
+  const rawIntensity = clamp(energy * 0.58 + bright * 0.42, 0, 1);
+  const modeMul = mode === 'cartoon' ? 1.2 : mode === 'energetic' ? 1.08 : 1;
+
+  const now = performance.now();
+  const hysteresis = 0.06;
+  const cooldownMs = 90;
+  const holdMs = 72;
+  const peak = timingState.peak || 0;
+  const isRising = rawIntensity > peak + hysteresis;
+  if (isRising && now >= (timingState.cooldownUntil || 0)) {
+    timingState.peak = rawIntensity;
+    timingState.holdUntil = now + holdMs;
+    timingState.cooldownUntil = now + cooldownMs;
+  } else if (now > (timingState.holdUntil || 0)) {
+    timingState.peak = smooth(peak, rawIntensity, 0.12);
+  }
+
+  const intensity = clamp(Math.max(rawIntensity, timingState.peak || 0) * modeMul, 0, 1);
+  return {
+    intensity,
+    eyeLift: clamp((0.18 + bright * 0.72) * intensity, 0, 1),
+    browLift: clamp((0.22 + bright * 0.78) * intensity, 0, 1),
+    headTilt: clamp((stableLow * 0.55 + energy * 0.45) * intensity, 0, 1),
+    mouthCorner: clamp((bright * 0.65 + energy * 0.35) * intensity, 0, 1),
+  };
+}
+
+function blendFaceState(visemeState, expressionState) {
+  const v = visemeState || { closed: 1, open: 0, wide: 0, round: 0, fv: 0 };
+  const e = expressionState || { intensity: 0, eyeLift: 0, browLift: 0, headTilt: 0, mouthCorner: 0 };
+
+  const expressionMouthMix = clamp((e.intensity || 0) * 0.18, 0, 0.22);
+  const mouth = normalizeVisemeWeights({
+    closed: clamp((v.closed || 0) + expressionMouthMix * 0.05, 0, 1),
+    open: clamp((v.open || 0) + expressionMouthMix * 0.08, 0, 1),
+    wide: clamp((v.wide || 0) + (e.mouthCorner || 0) * expressionMouthMix * 0.24, 0, 1),
+    round: clamp((v.round || 0) * (1 - expressionMouthMix * 0.2), 0, 1),
+    fv: clamp((v.fv || 0) * (1 - expressionMouthMix * 0.12), 0, 1),
+  });
+
+  return {
+    visemeWeights: mouth,
+    expression: {
+      eyeLift: e.eyeLift || 0,
+      browLift: e.browLift || 0,
+      headTilt: e.headTilt || 0,
+      mouthCorner: e.mouthCorner || 0,
+      intensity: e.intensity || 0,
+    },
+  };
+}
 function normalizeVisemeWeights(weights) {
   const clean = {
     closed: clamp(weights.closed || 0, 0, 1),
@@ -821,9 +896,9 @@ function renderOutput() {
     }
 
     if (avatarState.faceBox && audioState.level > 0.04) {
-      animateHeadBounce(avatarState.faceBox, audioState.level, audioState.featureState, audioState.pitchHz);
+      animateHeadBounce(avatarState.faceBox, audioState.level, audioState.featureState, audioState.pitchHz, audioState.expressionState);
       if (motionState.enabled) {
-        animateExpressionRegions(avatarState.faceBox, audioState.featureState, audioState.pitchHz);
+        animateExpressionRegions(avatarState.faceBox, audioState.featureState, audioState.pitchHz, audioState.expressionState);
       }
     }
   }
@@ -1025,7 +1100,7 @@ function affineFromTriangles(srcTri, dstTri) {
   return { a, b, c, d, e, f };
 }
 
-function animateHeadBounce(faceBox, level, features = {}, pitchHz = 0) {
+function animateHeadBounce(faceBox, level, features = {}, pitchHz = 0, expressionState = {}) {
   const profile = getResolvedProfileParams();
   const { x, y, w, h } = faceBox;
   const energy = features.energy || level || 0;
@@ -1033,7 +1108,8 @@ function animateHeadBounce(faceBox, level, features = {}, pitchHz = 0) {
   const centroidNorm = features.centroidNorm || 0;
   const pitchBoost = clamp((pitchHz - 180) / 420, 0, 1);
   const brightBoost = clamp((centroidNorm - 0.35) * 0.5 + pitchBoost * 0.25, 0, 0.42);
-  const dynamics = (1 + brightBoost) * profile.headMotionMul;
+  const expressionTilt = expressionState?.headTilt || 0;
+  const dynamics = (1 + brightBoost + expressionTilt * 0.25) * profile.headMotionMul;
 
   motionState.drift = smooth(motionState.drift, (lowBand - 0.5) * h * 0.03 * dynamics, 0.08);
   const noiseTarget = (Math.random() * 2 - 1) * h * 0.012 * (0.35 + energy * 0.65);
@@ -1103,13 +1179,14 @@ function profileStateMouthMul() {
   return getResolvedProfileParams().mouthDeformMul;
 }
 
-function animateExpressionRegions(faceBox, features = {}, pitchHz = 0) {
-  const emphasis = clamp((features.energy || 0) * 0.55 + (features.highBand || 0) * 0.3 + (features.centroidNorm || 0) * 0.15, 0, 1);
+function animateExpressionRegions(faceBox, features = {}, pitchHz = 0, expressionState = {}) {
+  const expressionBoost = expressionState?.intensity || 0;
+  const emphasis = clamp((features.energy || 0) * 0.45 + (features.highBand || 0) * 0.25 + (features.centroidNorm || 0) * 0.12 + expressionBoost * 0.32, 0, 1);
   if (emphasis < 0.08) return;
 
   const brightBoost = clamp((features.centroidNorm || 0) * 0.6 + clamp((pitchHz - 200) / 350, 0, 1) * 0.4, 0, 1);
-  const eyeShift = -(0.008 + brightBoost * 0.012) * emphasis;
-  const browShift = -(0.014 + brightBoost * 0.02) * emphasis;
+  const eyeShift = -(0.006 + brightBoost * 0.01 + (expressionState?.eyeLift || 0) * 0.006) * emphasis;
+  const browShift = -(0.012 + brightBoost * 0.018 + (expressionState?.browLift || 0) * 0.01) * emphasis;
 
   morphRegionVertical(getPreferredRegion('leftEye'), faceBox, eyeShift, faceBox.h * 0.025);
   morphRegionVertical(getPreferredRegion('rightEye'), faceBox, eyeShift, faceBox.h * 0.025);
