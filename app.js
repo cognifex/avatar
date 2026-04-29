@@ -37,6 +37,7 @@ let analyser;
 let micStream;
 let audioLoopId;
 let renderId;
+let trackingLoopId;
 
 const audioState = {
   level: 0,
@@ -161,6 +162,21 @@ const motionState = {
   prevEnergy: 0,
 };
 
+const trackingState = {
+  enabled: false,
+  landmarks: [],
+  confidence: 0,
+  lastSeenTs: 0,
+  pose: { yaw: 0, pitch: 0, roll: 0 },
+  fallbackMode: true,
+};
+
+const trackingConfig = {
+  fps: 24,
+  minConfidence: 0.5,
+  lostFaceMs: 700,
+};
+
 const regionEditState = {
   active: false,
   target: 'mouth',
@@ -173,6 +189,7 @@ const regionEditState = {
 setupDrawing();
 hydrateProfileSettings();
 bindProfileControls();
+startFaceTracking();
 renderId = requestAnimationFrame(renderOutput);
 
 clearBtn.addEventListener('click', () => {
@@ -505,6 +522,102 @@ function detectFaceRegionsFromDrawing(faceBox) {
   };
 
   return regions;
+}
+
+function normalizeRect(rect, width, height) {
+  if (!rect) return null;
+  return {
+    x: rect.x / width,
+    y: rect.y / height,
+    w: rect.w / width,
+    h: rect.h / height,
+  };
+}
+
+function normalizePolygon(points, width, height) {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  return points.map((point) => ({ x: point.x / width, y: point.y / height }));
+}
+
+function collectTrackingLandmarks(faceBox, regions, width, height) {
+  const keys = ['leftEye', 'rightEye', 'brows', 'mouth'];
+  const landmarks = [];
+  keys.forEach((key) => {
+    const region = regions?.[key];
+    if (!region) return;
+    if (region.type === 'polygon') {
+      landmarks.push({ key, type: 'polygon', points: normalizePolygon(region.points, width, height) });
+    } else {
+      landmarks.push({ key, type: 'rect', rect: normalizeRect(region, width, height) });
+    }
+  });
+  if (faceBox) landmarks.push({ key: 'face', type: 'rect', rect: normalizeRect(faceBox, width, height) });
+  return landmarks;
+}
+
+function estimatePoseFromFace(faceBox) {
+  if (!faceBox) return { yaw: 0, pitch: 0, roll: 0 };
+  const centerX = faceBox.x + faceBox.w / 2;
+  const centerY = faceBox.y + faceBox.h / 2;
+  return {
+    yaw: clamp((centerX / drawCanvas.width - 0.5) * 2, -1, 1),
+    pitch: clamp((centerY / drawCanvas.height - 0.5) * 2, -1, 1),
+    roll: 0,
+  };
+}
+
+function applyTrackingFallback() {
+  trackingState.enabled = false;
+  trackingState.fallbackMode = true;
+  trackingState.confidence = 0;
+  trackingState.landmarks = [];
+  trackingState.pose = { yaw: 0, pitch: 0, roll: 0 };
+}
+
+function analyzeTrackingFrame(now = performance.now()) {
+  const box = detectFaceBoxFromDrawing();
+  if (!box) {
+    if (trackingState.lastSeenTs && now - trackingState.lastSeenTs > trackingConfig.lostFaceMs) {
+      applyTrackingFallback();
+      avatarState.faceBox = null;
+      avatarState.autoFaceRegions = null;
+    }
+    return;
+  }
+
+  const regions = detectFaceRegionsFromDrawing(box);
+  const coverage = (box.w * box.h) / (drawCanvas.width * drawCanvas.height);
+  const confidence = clamp(coverage * 5, 0, 1);
+  trackingState.confidence = confidence;
+  if (confidence < trackingConfig.minConfidence) return;
+
+  trackingState.enabled = true;
+  trackingState.fallbackMode = false;
+  trackingState.lastSeenTs = now;
+  trackingState.pose = estimatePoseFromFace(box);
+  trackingState.landmarks = collectTrackingLandmarks(box, regions, drawCanvas.width, drawCanvas.height);
+  avatarState.faceBox = box;
+  avatarState.autoFaceRegions = regions;
+}
+
+function startFaceTracking() {
+  if (trackingLoopId) return;
+  const frameInterval = 1000 / trackingConfig.fps;
+  let lastTick = 0;
+  const loop = (ts) => {
+    if (!lastTick || ts - lastTick >= frameInterval) {
+      lastTick = ts;
+      analyzeTrackingFrame(ts);
+    }
+    trackingLoopId = requestAnimationFrame(loop);
+  };
+  trackingLoopId = requestAnimationFrame(loop);
+}
+
+function stopFaceTracking() {
+  if (trackingLoopId) cancelAnimationFrame(trackingLoopId);
+  trackingLoopId = undefined;
+  applyTrackingFallback();
 }
 
 function detectBandRect(data, width, faceBox, yRange, xRange) {
