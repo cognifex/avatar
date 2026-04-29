@@ -16,6 +16,7 @@ const adoptRegionBtn = document.getElementById('adoptRegionBtn');
 const resetRegionBtn = document.getElementById('resetRegionBtn');
 const statusEl = document.getElementById('status');
 const transparentBg = document.getElementById('transparentBg');
+const expressiveMotionToggle = document.getElementById('expressiveMotionToggle');
 const outputWrap = document.getElementById('outputWrap');
 
 const drawCtx = drawCanvas.getContext('2d');
@@ -93,6 +94,14 @@ const avatarState = {
   baseFrame: null,
 };
 
+const motionState = {
+  enabled: true,
+  drift: 0,
+  microNoise: 0,
+  nod: 0,
+  prevEnergy: 0,
+};
+
 const regionEditState = {
   active: false,
   target: 'mouth',
@@ -165,6 +174,10 @@ stopMicBtn.addEventListener('click', () => {
 
 transparentBg.addEventListener('change', () => {
   outputWrap.classList.toggle('transparent', transparentBg.checked);
+});
+
+expressiveMotionToggle?.addEventListener('change', () => {
+  motionState.enabled = expressiveMotionToggle.checked;
 });
 
 regionSelect.addEventListener('change', () => {
@@ -761,8 +774,11 @@ function renderOutput() {
       animateMouthFromRegion(mouthRegion, audioState.visemeWeights);
     }
 
-    if (avatarState.faceBox && audioState.level > 0.08) {
-      animateHeadBounce(avatarState.faceBox, audioState.level);
+    if (avatarState.faceBox && audioState.level > 0.04) {
+      animateHeadBounce(avatarState.faceBox, audioState.level, audioState.featureState, audioState.pitchHz);
+      if (motionState.enabled) {
+        animateExpressionRegions(avatarState.faceBox, audioState.featureState, audioState.pitchHz);
+      }
     }
   }
 
@@ -962,16 +978,64 @@ function affineFromTriangles(srcTri, dstTri) {
   return { a, b, c, d, e, f };
 }
 
-function animateHeadBounce(faceBox, level) {
+function animateHeadBounce(faceBox, level, features = {}, pitchHz = 0) {
   const { x, y, w, h } = faceBox;
-  const amp = Math.min(6, level * 60);
-  const offsetY = Math.sin(performance.now() / 70) * amp;
+  const energy = features.energy || level || 0;
+  const lowBand = features.lowBand || 0;
+  const centroidNorm = features.centroidNorm || 0;
+  const pitchBoost = clamp((pitchHz - 180) / 420, 0, 1);
+  const brightBoost = clamp((centroidNorm - 0.35) * 0.5 + pitchBoost * 0.25, 0, 0.42);
+  const dynamics = 1 + brightBoost;
+
+  motionState.drift = smooth(motionState.drift, (lowBand - 0.5) * h * 0.03 * dynamics, 0.08);
+  const noiseTarget = (Math.random() * 2 - 1) * h * 0.012 * (0.35 + energy * 0.65);
+  motionState.microNoise = smooth(motionState.microNoise, noiseTarget, 0.07);
+
+  const energyRise = energy - (motionState.prevEnergy || 0);
+  motionState.prevEnergy = energy;
+  if (energyRise > 0.08 && energy > 0.12) {
+    motionState.nod = Math.min(motionState.nod + energyRise * h * 0.11 * dynamics, h * 0.09);
+  }
+  motionState.nod *= 0.82;
+  const offsetY = clamp(motionState.drift + motionState.microNoise + motionState.nod, -h * 0.1, h * 0.1);
 
   bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
   bufferCtx.drawImage(outputCanvas, 0, 0);
 
   outputCtx.clearRect(x - 2, y - 2, w + 4, h + 4);
   outputCtx.drawImage(bufferCanvas, x, y, w, h, x, y + offsetY, w, h);
+}
+
+function animateExpressionRegions(faceBox, features = {}, pitchHz = 0) {
+  const emphasis = clamp((features.energy || 0) * 0.55 + (features.highBand || 0) * 0.3 + (features.centroidNorm || 0) * 0.15, 0, 1);
+  if (emphasis < 0.08) return;
+
+  const brightBoost = clamp((features.centroidNorm || 0) * 0.6 + clamp((pitchHz - 200) / 350, 0, 1) * 0.4, 0, 1);
+  const eyeShift = -(0.008 + brightBoost * 0.012) * emphasis;
+  const browShift = -(0.014 + brightBoost * 0.02) * emphasis;
+
+  morphRegionVertical(getPreferredRegion('leftEye'), faceBox, eyeShift, faceBox.h * 0.025);
+  morphRegionVertical(getPreferredRegion('rightEye'), faceBox, eyeShift, faceBox.h * 0.025);
+  morphRegionVertical(getPreferredRegion('brows'), faceBox, browShift, faceBox.h * 0.035);
+}
+
+function morphRegionVertical(region, faceBox, scaleDelta, pixelCap) {
+  if (!region) return;
+  const bounds = getRegionBounds(region);
+  if (!bounds) return;
+  const dy = clamp(scaleDelta * bounds.h, -pixelCap, pixelCap);
+  const hardCap = faceBox.h * 0.08;
+  const finalDy = clamp(dy, -hardCap, hardCap);
+
+  bufferCtx.clearRect(0, 0, bufferCanvas.width, bufferCanvas.height);
+  bufferCtx.drawImage(outputCanvas, 0, 0);
+
+  outputCtx.save();
+  traceRegionPath(outputCtx, region);
+  outputCtx.clip();
+  outputCtx.clearRect(bounds.x - 2, bounds.y - 2, bounds.w + 4, bounds.h + 4);
+  outputCtx.drawImage(bufferCanvas, bounds.x, bounds.y, bounds.w, bounds.h, bounds.x, bounds.y + finalDy, bounds.w, bounds.h);
+  outputCtx.restore();
 }
 
 function setStatus(message) {
