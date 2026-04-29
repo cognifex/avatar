@@ -28,12 +28,30 @@
         </div>
         <div class="toolbar">
           <label>
+            Profil
+            <select id="profileSelect">
+              <option value="natural">Natural</option>
+              <option value="energetic">Energetic</option>
+              <option value="cartoon">Cartoon</option>
+            </select>
+          </label>
+          <label>
             Sensitivity
             <input id="sensitivityInput" type="range" min="0.6" max="2.2" step="0.05" value="1" />
           </label>
           <label>
             Latency
             <input id="latencyInput" type="range" min="0" max="1" step="0.01" value="0.35" />
+          </label>
+        </div>
+        <div class="toolbar">
+          <label>
+            Responsiveness
+            <input id="responsivenessInput" type="range" min="0" max="1" step="0.01" value="0.5" />
+          </label>
+          <label>
+            Expressiveness
+            <input id="expressivenessInput" type="range" min="0" max="1" step="0.01" value="0.5" />
           </label>
         </div>
 
