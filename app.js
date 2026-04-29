@@ -67,9 +67,14 @@ const audioState = {
     mouthCorner: 0,
   },
   expressionTiming: {
+    phase: 'idle',
     peak: 0,
     holdUntil: 0,
+    hitUntil: 0,
+    releaseUntil: 0,
     cooldownUntil: 0,
+    microFreezeFrames: 0,
+    prevVoiced: false,
   },
 };
 
@@ -660,7 +665,16 @@ function stopMic() {
   audioState.featureState = { energy: 0, lowBand: 0, midBand: 0, highBand: 0, centroidNorm: 0, zeroCrossNorm: 0 };
   audioState.visemeHoldUntil = 0;
   audioState.expressionState = { intensity: 0, eyeLift: 0, browLift: 0, headTilt: 0, mouthCorner: 0 };
-  audioState.expressionTiming = { peak: 0, holdUntil: 0, cooldownUntil: 0 };
+  audioState.expressionTiming = {
+    phase: 'idle',
+    peak: 0,
+    holdUntil: 0,
+    hitUntil: 0,
+    releaseUntil: 0,
+    cooldownUntil: 0,
+    microFreezeFrames: 0,
+    prevVoiced: false,
+  };
 }
 
 function estimatePitch(samples, sampleRate) {
@@ -765,26 +779,70 @@ function deriveVisemeWeights(features, pitchHz, sensitivity) {
 function deriveExpressionState(audioFeatures, timingState, mode = 'natural') {
   const features = audioFeatures || {};
   const energy = features.energy || 0;
-  const bright = clamp((features.highBand || 0) * 0.62 + (features.centroidNorm || 0) * 0.38, 0, 1);
+  const highBand = features.highBand || 0;
+  const zeroCrossNorm = features.zeroCrossNorm || 0;
+  const bright = clamp(highBand * 0.62 + (features.centroidNorm || 0) * 0.38, 0, 1);
   const stableLow = clamp((features.lowBand || 0) * 0.7 + energy * 0.3, 0, 1);
   const rawIntensity = clamp(energy * 0.58 + bright * 0.42, 0, 1);
   const modeMul = mode === 'cartoon' ? 1.2 : mode === 'energetic' ? 1.08 : 1;
 
   const now = performance.now();
-  const hysteresis = 0.06;
-  const cooldownMs = 90;
-  const holdMs = 72;
-  const peak = timingState.peak || 0;
-  const isRising = rawIntensity > peak + hysteresis;
-  if (isRising && now >= (timingState.cooldownUntil || 0)) {
-    timingState.peak = rawIntensity;
-    timingState.holdUntil = now + holdMs;
-    timingState.cooldownUntil = now + cooldownMs;
-  } else if (now > (timingState.holdUntil || 0)) {
-    timingState.peak = smooth(peak, rawIntensity, 0.12);
+  const voicedSignal = clamp(energy * 0.75 + (features.lowBand || 0) * 0.25, 0, 1);
+  const unvoicedSignal = clamp(highBand * 0.62 + zeroCrossNorm * 0.38, 0, 1);
+  const confidence = clamp((voicedSignal + unvoicedSignal) * 0.5, 0, 1);
+  const isNoisy = confidence < 0.14 || (energy < 0.07 && zeroCrossNorm > 0.88);
+
+  if (isNoisy) {
+    timingState.phase = 'idle';
+    timingState.peak = smooth(timingState.peak || 0, 0, 0.25);
+    timingState.prevVoiced = voicedSignal > 0.22;
+    return { intensity: 0, eyeLift: 0, browLift: 0, headTilt: 0, mouthCorner: 0 };
   }
 
-  const intensity = clamp(Math.max(rawIntensity, timingState.peak || 0) * modeMul, 0, 1);
+  const prevVoiced = !!timingState.prevVoiced;
+  const isVoiced = voicedSignal > 0.22;
+  const voicedTransition = isVoiced !== prevVoiced;
+  timingState.prevVoiced = isVoiced;
+
+  const riseThreshold = 0.08;
+  const isRising = rawIntensity > (timingState.peak || 0) + riseThreshold;
+  const hitMs = 80 + Math.round(Math.random() * 60);
+  const holdMs = 120 + Math.round(Math.random() * 140);
+  const releaseMs = 180;
+
+  if ((isRising || voicedTransition) && now >= (timingState.cooldownUntil || 0)) {
+    timingState.phase = 'build';
+    timingState.peak = Math.max(rawIntensity, timingState.peak || 0);
+  }
+
+  if (timingState.phase === 'build' && rawIntensity >= (timingState.peak || 0) - 0.02) {
+    timingState.phase = 'hit';
+    timingState.hitUntil = now + hitMs;
+    timingState.holdUntil = timingState.hitUntil + holdMs;
+    timingState.releaseUntil = timingState.holdUntil + releaseMs;
+    timingState.cooldownUntil = timingState.releaseUntil + 70;
+    if (mode === 'cartoon') timingState.microFreezeFrames = 1 + Math.round(Math.random());
+  }
+
+  if (timingState.phase === 'hit' && now >= (timingState.hitUntil || 0)) timingState.phase = 'hold';
+  if (timingState.phase === 'hold' && now >= (timingState.holdUntil || 0)) timingState.phase = 'release';
+  if (timingState.phase === 'release' && now >= (timingState.releaseUntil || 0)) timingState.phase = 'idle';
+
+  let phaseGain = 0.55;
+  if (timingState.phase === 'build') phaseGain = 0.8;
+  else if (timingState.phase === 'hit') phaseGain = 1.25;
+  else if (timingState.phase === 'hold') phaseGain = 1.08;
+  else if (timingState.phase === 'release') phaseGain = 0.68;
+
+  if ((timingState.microFreezeFrames || 0) > 0) {
+    phaseGain = Math.max(phaseGain, 1.2);
+    timingState.microFreezeFrames -= 1;
+  }
+
+  const targetPeak = Math.max(rawIntensity, timingState.peak || 0);
+  timingState.peak = smooth(timingState.peak || 0, targetPeak, timingState.phase === 'release' ? 0.16 : 0.09);
+
+  const intensity = clamp(Math.max(rawIntensity, timingState.peak || 0) * phaseGain * modeMul, 0, 1);
   return {
     intensity,
     eyeLift: clamp((0.18 + bright * 0.72) * intensity, 0, 1),
