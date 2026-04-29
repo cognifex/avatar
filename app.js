@@ -22,6 +22,9 @@ const drawRegionBtn = document.getElementById('drawRegionBtn');
 const adoptRegionBtn = document.getElementById('adoptRegionBtn');
 const resetRegionBtn = document.getElementById('resetRegionBtn');
 const trackingToggleBtn = document.getElementById('trackingToggleBtn');
+const startCameraBtn = document.getElementById('startCameraBtn');
+const calibrateTrackingBtn = document.getElementById('calibrateTrackingBtn');
+const cameraDeviceSelect = document.getElementById('cameraDeviceSelect');
 const modeSelect = document.getElementById('modeSelect');
 const debugOverlayToggle = document.getElementById('debugOverlayToggle');
 const statusEl = document.getElementById('status');
@@ -199,6 +202,11 @@ const trackingState = {
     outlierRejects: 0,
   },
   status: 'idle',
+  selectedDeviceId: '',
+  currentDeviceLabel: 'default',
+  cameraFps: 0,
+  lastFrameTs: 0,
+  calibration: null,
 };
 
 const trackingConfig = {
@@ -700,7 +708,7 @@ function analyzeTrackingFrame(now = performance.now()) {
     if (!trackingState.fallbackMode) applyTrackingFallback('disabled');
     return;
   }
-  const cameraResult = detectFaceFromTrackingVideo();
+  const cameraResult = detectFaceFromTrackingVideo(now);
   const box = cameraResult?.faceBox || detectFaceBoxFromDrawing();
   const regions = cameraResult?.regions || (box ? detectFaceRegionsFromDrawing(box) : null);
   const source = cameraResult?.faceBox ? 'camera' : 'drawing_fallback';
@@ -732,10 +740,14 @@ function analyzeTrackingFrame(now = performance.now()) {
   }
   trackingState.lastSeenTs = now;
   const rawPose = estimatePoseFromFace(box);
+  const calibration = trackingState.calibration;
+  const calibratedPose = calibration?.pose
+    ? { yaw: rawPose.yaw - calibration.pose.yaw, pitch: rawPose.pitch - calibration.pose.pitch, roll: rawPose.roll - calibration.pose.roll }
+    : rawPose;
   trackingState.pose = {
-    yaw: adaptiveSmooth(rawPose.yaw, trackingState.pose.yaw, rawPose.yaw - trackingState.pose.yaw, dt, confidence),
-    pitch: adaptiveSmooth(rawPose.pitch, trackingState.pose.pitch, rawPose.pitch - trackingState.pose.pitch, dt, confidence),
-    roll: adaptiveSmooth(rawPose.roll, trackingState.pose.roll, rawPose.roll - trackingState.pose.roll, dt, confidence),
+    yaw: adaptiveSmooth(calibratedPose.yaw, trackingState.pose.yaw, calibratedPose.yaw - trackingState.pose.yaw, dt, confidence),
+    pitch: adaptiveSmooth(calibratedPose.pitch, trackingState.pose.pitch, calibratedPose.pitch - trackingState.pose.pitch, dt, confidence),
+    roll: adaptiveSmooth(calibratedPose.roll, trackingState.pose.roll, calibratedPose.roll - trackingState.pose.roll, dt, confidence),
   };
   const rawLandmarks = collectTrackingLandmarks(box, regions, drawCanvas.width, drawCanvas.height);
   let frameJitter = 0;
@@ -787,16 +799,31 @@ function stopFaceTracking() {
 async function startCameraTracking() {
   if (!trackingVideo || trackingStream) return;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+    await populateCameraDevices();
+    const stream = await navigator.mediaDevices.getUserMedia({ video: buildCameraConstraints() });
     trackingStream = stream;
     trackingVideo.srcObject = stream;
     await trackingVideo.play();
+    const videoTrack = stream.getVideoTracks()[0];
+    const settings = videoTrack?.getSettings?.() || {};
+    trackingState.currentDeviceLabel = videoTrack?.label || 'default';
+    trackingState.selectedDeviceId = settings.deviceId || trackingState.selectedDeviceId || '';
     trackingState.cameraAccess = 'granted';
     if (trackingState.status !== 'tracking') trackingState.status = 'camera_ready';
+    setStatus('Kamera bereit.');
   } catch (err) {
     console.error('Camera tracking start failed:', err);
-    trackingState.cameraAccess = 'denied';
-    trackingState.status = 'camera_denied';
+    if (err?.name === 'NotAllowedError' || err?.name === 'SecurityError') {
+      trackingState.cameraAccess = 'denied';
+      trackingState.status = 'camera_denied';
+    } else if (err?.name === 'NotFoundError' || err?.name === 'OverconstrainedError') {
+      trackingState.cameraAccess = 'missing';
+      trackingState.status = 'camera_missing';
+    } else {
+      trackingState.cameraAccess = 'error';
+      trackingState.status = 'camera_error';
+    }
+    updateTrackingStatusMessage();
   }
 }
 
@@ -808,7 +835,7 @@ function stopCameraTracking() {
   trackingState.cameraAccess = 'stopped';
 }
 
-function detectFaceFromTrackingVideo() {
+function detectFaceFromTrackingVideo(now = performance.now()) {
   if (!trackingVideo || !trackingVideo.videoWidth || !trackingVideo.videoHeight) return null;
   const videoW = trackingVideo.videoWidth;
   const videoH = trackingVideo.videoHeight;
@@ -816,6 +843,11 @@ function detectFaceFromTrackingVideo() {
   trackingDebugCanvas.width = videoW;
   trackingDebugCanvas.height = videoH;
   trackingDebugCtx.drawImage(trackingVideo, 0, 0, videoW, videoH);
+  if (trackingState.lastFrameTs) {
+    const dt = Math.max(1, now - trackingState.lastFrameTs);
+    trackingState.cameraFps = smooth(trackingState.cameraFps || 0, 1000 / dt, 0.15);
+  }
+  trackingState.lastFrameTs = now;
   const frame = trackingDebugCtx.getImageData(0, 0, videoW, videoH);
   const faceInVideo = detectFaceBoxFromPixels(frame.data, videoW, videoH, isSkinLikePixel);
   if (!faceInVideo) return null;
@@ -1234,21 +1266,30 @@ function blendFaceState(visemeState, expressionState, landmarkState, tracking) {
   const l = landmarkState || { valid: false, mouth: {}, eyes: {}, brows: {} };
   const trackingValid = !!(tracking?.enabled && !tracking?.fallbackMode && (tracking?.confidence || 0) >= trackingConfig.minConfidence);
   const mouthLandmarkMin = trackingValid ? 0.28 : 0;
+  const calibration = tracking?.calibration;
+  const mouthOffset = calibration?.landmarks?.mouthOpen || 0;
+  const eyeOffset = calibration?.landmarks?.eyesOpenness || 0;
+  const browOffset = calibration?.landmarks?.browsLift || 0;
+  const calibratedOpen = clamp((l.mouth?.open || 0) - mouthOffset, 0, 1);
+  const calibratedWide = clamp((l.mouth?.wide || 0) - mouthOffset * 0.6, 0, 1);
+  const calibratedRound = clamp((l.mouth?.round || 0) - mouthOffset * 0.6, 0, 1);
+  const calibratedEye = clamp((l.eyes?.openness || 0) - eyeOffset, 0, 1);
+  const calibratedBrow = clamp((l.brows?.lift || 0) - browOffset, 0, 1);
   const audioKick = trackingValid ? 0.72 : 1;
 
   const mouth = normalizeVisemeWeights({
-    closed: clamp((v.closed || 0) * audioKick + mouthLandmarkMin * (1 - (l.mouth?.open || 0)), 0, 1),
-    open: clamp((v.open || 0) * audioKick + mouthLandmarkMin * (l.mouth?.open || 0), 0, 1),
-    wide: clamp((v.wide || 0) * audioKick + mouthLandmarkMin * (l.mouth?.wide || 0), 0, 1),
-    round: clamp((v.round || 0) * audioKick + mouthLandmarkMin * (l.mouth?.round || 0), 0, 1),
+    closed: clamp((v.closed || 0) * audioKick + mouthLandmarkMin * (1 - calibratedOpen), 0, 1),
+    open: clamp((v.open || 0) * audioKick + mouthLandmarkMin * calibratedOpen, 0, 1),
+    wide: clamp((v.wide || 0) * audioKick + mouthLandmarkMin * calibratedWide, 0, 1),
+    round: clamp((v.round || 0) * audioKick + mouthLandmarkMin * calibratedRound, 0, 1),
     fv: clamp((v.fv || 0) * audioKick, 0, 1),
   });
 
   return {
     visemeWeights: mouth,
     expression: {
-      eyeLift: clamp((e.eyeLift || 0) * 0.6 + (l.eyes?.openness || 0) * 0.4, 0, 1),
-      browLift: clamp((e.browLift || 0) * 0.6 + (l.brows?.lift || 0) * 0.4, 0, 1),
+      eyeLift: clamp((e.eyeLift || 0) * 0.6 + calibratedEye * 0.4, 0, 1),
+      browLift: clamp((e.browLift || 0) * 0.6 + calibratedBrow * 0.4, 0, 1),
       headTilt: e.headTilt || 0,
       mouthCorner: clamp((e.mouthCorner || 0) * 0.6 + Math.max(0, l.mouth?.corners || 0) * 0.4, 0, 1),
       intensity: e.intensity || 0,
@@ -1919,6 +1960,18 @@ function bindTrackingControls() {
     trackingState.debugOverlay = debugOverlayToggle.checked;
     persistProfileSettings();
   });
+  startCameraBtn?.addEventListener('click', async () => {
+    stopCameraTracking();
+    await startCameraTracking();
+  });
+  cameraDeviceSelect?.addEventListener('change', async () => {
+    trackingState.selectedDeviceId = cameraDeviceSelect.value || '';
+    if (trackingStream) {
+      stopCameraTracking();
+      await startCameraTracking();
+    }
+  });
+  calibrateTrackingBtn?.addEventListener('click', calibrateTrackingBaseline);
 }
 
 function drawDebugOverlay() {
@@ -1932,6 +1985,9 @@ function drawDebugOverlay() {
   const lines = [
     `Confidence: ${(trackingState.confidence || 0).toFixed(2)}`,
     `Status: ${trackingState.status || 'idle'}`,
+    `Device: ${trackingState.currentDeviceLabel || 'default'}`,
+    `FPS: ${(trackingState.cameraFps || 0).toFixed(1)} Drop: ${trackingState.diagnostics.dropFrames || 0}`,
+    `Jitter: ${(trackingState.diagnostics.jitterScore || 0).toFixed(4)}`,
     `Blend: c:${(vw.closed||0).toFixed(2)} o:${(vw.open||0).toFixed(2)} w:${(vw.wide||0).toFixed(2)} r:${(vw.round||0).toFixed(2)} fv:${(vw.fv||0).toFixed(2)}`
   ];
   lines.forEach((line, i) => outputCtx.fillText(line, 20, 34 + i * 20));
@@ -1961,7 +2017,44 @@ function updateTrackingStatusMessage() {
     setStatus('Tracking deaktiviert (Audio only).');
     return;
   }
-  if (trackingState.status === 'camera_denied') setStatus('Kamera nicht erlaubt. Bitte Kamera-Berechtigung im Browser aktivieren.');
-  else if (trackingState.status === 'tracking') setStatus(`Tracking aktiv (Confidence ${(trackingState.confidence || 0).toFixed(2)}).`);
-  else if (trackingState.status === 'reacquiring' || trackingState.status === 'face_lost') setStatus('Kein Gesicht im Kamerabild. Bitte frontal ins Bild schauen.');
+  if (trackingState.status === 'camera_denied') setStatus('Tracking status: Permission denied.');
+  else if (trackingState.status === 'camera_missing') setStatus('Tracking status: Device not found.');
+  else if (trackingState.status === 'tracking') setStatus(`Tracking status: Tracking active (confidence ${(trackingState.confidence || 0).toFixed(2)}).`);
+  else if (trackingState.status === 'reacquiring') setStatus('Tracking status: Low confidence.');
+  else if (trackingState.status === 'face_lost') setStatus('Tracking status: Face not visible.');
+}
+
+async function populateCameraDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices || !cameraDeviceSelect) return;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cameras = devices.filter((device) => device.kind === 'videoinput');
+  cameraDeviceSelect.innerHTML = '<option value="">Standardkamera</option>';
+  cameras.forEach((camera, index) => {
+    const option = document.createElement('option');
+    option.value = camera.deviceId;
+    option.textContent = camera.label || `Kamera ${index + 1}`;
+    if (trackingState.selectedDeviceId && trackingState.selectedDeviceId === camera.deviceId) option.selected = true;
+    cameraDeviceSelect.appendChild(option);
+  });
+}
+
+function buildCameraConstraints() {
+  return trackingState.selectedDeviceId ? { deviceId: { exact: trackingState.selectedDeviceId } } : { facingMode: 'user' };
+}
+
+function calibrateTrackingBaseline() {
+  if (!trackingState.enabled || trackingState.status !== 'tracking') {
+    setStatus('Tracking status: Face not visible.');
+    return;
+  }
+  trackingState.calibration = {
+    pose: { ...trackingState.pose },
+    landmarks: {
+      mouthOpen: landmarkExpressionState?.mouth?.open || 0,
+      eyesOpenness: landmarkExpressionState?.eyes?.openness || 0,
+      browsLift: landmarkExpressionState?.brows?.lift || 0,
+    },
+    timestamp: Date.now(),
+  };
+  setStatus('Tracking calibration saved.');
 }
